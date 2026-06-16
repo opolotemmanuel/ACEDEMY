@@ -1,0 +1,13 @@
+{
+  "name": "aqodh-academy-course-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AQODH Academy Ethical Computing Fundamentals LMS prototype.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node --check app.js && node --check server.js && node --check server/auth.js && node --check server/db.js && node --check backend/src/ai/aiClient.js",
+    "ai:dev": "cd ai-service && uvicorn main:app --reload --host 127.0.0.1 --port 8000",
+    "ai:check": "python3 -m py_compile ai-service/main.py ai-service/app/routes/*.py ai-service/app/services/*.py ai-service/app/schemas/*.py"
+  }
+}

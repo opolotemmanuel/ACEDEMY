@@ -1,0 +1,13 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">AQODH Academy Logo</title>
+  <desc id="desc">A blue and gold academic shield logo for AQODH Academy.</desc>
+  <rect width="512" height="512" rx="96" fill="#F8FAFC"/>
+  <path d="M256 42L428 112V238C428 346 357 431 256 470C155 431 84 346 84 238V112L256 42Z" fill="#1E3A8A"/>
+  <path d="M256 74L396 132V240C396 326 341 396 256 432C171 396 116 326 116 240V132L256 74Z" fill="#F8FAFC"/>
+  <path d="M256 104L366 150V243C366 307 327 365 256 398C185 365 146 307 146 243V150L256 104Z" fill="#1E3A8A"/>
+  <circle cx="256" cy="226" r="78" fill="#D99A2B"/>
+  <path d="M209 275L256 142L303 275H273L264 248H219L210 275H209ZM226 225H257L242 178L226 225Z" fill="#1E3A8A"/>
+  <path d="M318 238C318 267 295 290 266 290H247V266H266C282 266 294 254 294 238C294 222 282 210 266 210H247V186H266C295 186 318 209 318 238Z" fill="#1E3A8A"/>
+  <path d="M178 326H334" stroke="#D99A2B" stroke-width="18" stroke-linecap="round"/>
+  <path d="M205 354H307" stroke="#D99A2B" stroke-width="12" stroke-linecap="round"/>
+</svg>
