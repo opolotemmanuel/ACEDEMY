@@ -65,6 +65,7 @@ function verifyJwt(token) {
 function publicUser(user) {
   if (!user) return null;
   const { passwordHash, resetTokenHash, ...safeUser } = user;
+  if (safeUser.role) safeUser.role = String(safeUser.role).toLowerCase();
   return safeUser;
 }
 

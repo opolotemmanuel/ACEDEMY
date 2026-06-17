@@ -6,8 +6,21 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check app.js && node --check server.js && node --check server/auth.js && node --check server/db.js && node --check backend/src/ai/aiClient.js",
+    "check": "node --check app.js && node --check server.js && node --check server/auth.js && node --check backend/src/ai/aiClient.js && node --check backend/src/content/contentRoutes.js && node --check backend/src/prisma.js && node --check src/lib/prisma.js && node --check prisma/seed.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:seed": "node prisma/seed.js",
     "ai:dev": "cd ai-service && uvicorn main:app --reload --host 127.0.0.1 --port 8000",
     "ai:check": "python3 -m py_compile ai-service/main.py ai-service/app/routes/*.py ai-service/app/services/*.py ai-service/app/schemas/*.py"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.0",
+    "bcrypt": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "multer": "^1.4.5-lts.2"
+  },
+  "devDependencies": {
+    "prisma": "^6.19.0"
   }
 }
