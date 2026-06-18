@@ -3,10 +3,11 @@ require("dotenv").config();
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const prisma = require("./src/lib/prisma");
-const { signJwt, verifyJwt, publicUser } = require("./server/auth");
+const { publicUser } = require("./server/auth");
+const authRoutes = require("./src/auth/auth.routes");
+const { authenticate: authMiddleware, requireRole: roleMiddleware } = require("./src/auth/auth.middleware");
 const contentRoutes = require("./backend/src/content/contentRoutes");
 
 const PORT = Number(process.env.PORT || 3000);
@@ -42,12 +43,14 @@ function securityHeaders(req) {
   return headers;
 }
 
-function sendJson(req, res, status, data) {
+function sendJson(req, res, status, data, extraHeaders = {}) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Credentials": "true",
     ...securityHeaders(req),
+    ...extraHeaders,
   });
   res.end(JSON.stringify(data));
 }
@@ -75,7 +78,21 @@ function readBody(req) {
 
 function tokenFromRequest(req) {
   const header = req.headers.authorization || "";
-  return header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (header.startsWith("Bearer ")) return header.slice(7);
+  return parseCookies(req).aqodh_token || "";
+}
+
+function parseCookies(req) {
+  return String(req.headers.cookie || "")
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .reduce((cookies, part) => {
+      const index = part.indexOf("=");
+      if (index === -1) return cookies;
+      cookies[decodeURIComponent(part.slice(0, index))] = decodeURIComponent(part.slice(index + 1));
+      return cookies;
+    }, {});
 }
 
 function clientIp(req) {
@@ -127,18 +144,23 @@ function normalizeCourseStatus(status, fallback = "DRAFT") {
   return ["DRAFT", "PUBLISHED", "ARCHIVED"].includes(value) ? value : fallback;
 }
 
-function hashToken(token) {
-  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
+function isDatabaseConnectionError(error) {
+  const message = String(error?.message || "");
+  return error?.name === "PrismaClientInitializationError" || message.includes("Can't reach database server") || message.includes("Authentication failed against database server");
 }
 
 async function authenticate(req) {
-  const token = tokenFromRequest(req);
-  const payload = verifyJwt(token);
-  if (!payload) return { error: "Invalid or expired token" };
-
-  const user = await prisma.user.findUnique({ where: { id: payload.sub } });
-  if (!user || user.status !== "ACTIVE") return { error: "User is not active" };
-  return { user, token, tokenHash: hashToken(token) };
+  return new Promise((resolve) => {
+    authMiddleware(req, {
+      status(statusCode) {
+        return {
+          json(data) {
+            resolve({ error: data.error || "Unauthorized", statusCode });
+          },
+        };
+      },
+    }, () => resolve(req.auth));
+  });
 }
 
 async function requireAuth(req, res) {
@@ -172,6 +194,69 @@ async function currentCourse() {
   });
 }
 
+function serializeCourse(course) {
+  return {
+    ...course,
+    price: course.price?.toString ? course.price.toString() : course.price,
+    creator: publicUser(course.creator),
+    enrollments: (course.enrollments || []).map((enrollment) => ({
+      ...enrollment,
+      student: publicUser(enrollment.student),
+    })),
+    progress: (course.progress || []).map((record) => ({
+      ...record,
+      student: publicUser(record.student),
+      course: { id: course.id, title: course.title, slug: course.slug },
+    })),
+  };
+}
+
+async function dashboardCourses(where = {}) {
+  const courses = await prisma.course.findMany({
+    where,
+    orderBy: { createdAt: "asc" },
+    include: {
+      creator: true,
+      modules: {
+        orderBy: { moduleOrder: "asc" },
+        include: { lessons: { orderBy: { lessonOrder: "asc" } } },
+      },
+      enrollments: {
+        orderBy: { enrolledAt: "desc" },
+        include: { student: true },
+      },
+      progress: {
+        orderBy: { updatedAt: "desc" },
+        include: {
+          student: true,
+          currentModule: true,
+          currentLesson: true,
+        },
+      },
+    },
+  });
+  return courses.map(serializeCourse);
+}
+
+function dashboardSummary(users, courses) {
+  const enrollments = courses.flatMap((course) => course.enrollments || []);
+  const progressRecords = courses.flatMap((course) => course.progress || []);
+  return {
+    totalUsers: users.length,
+    totalStudents: users.filter((user) => user.role === "student").length,
+    totalInstructors: users.filter((user) => user.role === "instructor").length,
+    totalAdmins: users.filter((user) => user.role === "admin").length,
+    totalCourses: courses.length,
+    totalModules: courses.reduce((sum, course) => sum + (course.modules?.length || 0), 0),
+    totalLessons: courses.reduce((sum, course) => sum + (course.modules || []).reduce((moduleSum, module) => moduleSum + (module.lessons?.length || 0), 0), 0),
+    totalEnrollments: enrollments.length,
+    activeEnrollments: enrollments.filter((enrollment) => enrollment.enrollmentStatus === "ACTIVE").length,
+    averageProgress: progressRecords.length
+      ? Math.round(progressRecords.reduce((sum, record) => sum + Number(record.progressPercentage || 0), 0) / progressRecords.length)
+      : 0,
+  };
+}
+
 async function ensureStudentEnrollment(studentId, courseId) {
   const course = await prisma.course.findUnique({ where: { id: courseId } });
   if (!course || course.status !== "PUBLISHED") return null;
@@ -201,75 +286,12 @@ async function handleApi(req, res, pathname) {
     }
 
     if (pathname === "/api/health" && req.method === "GET") {
-      await prisma.$queryRaw`SELECT 1`;
-      return sendJson(req, res, 200, { status: "ok", database: "connected" });
-    }
-
-    if (pathname === "/api/auth/register" && req.method === "POST") {
-      const body = await readBody(req);
-      const fullName = String(body.fullName || "").trim();
-      const email = String(body.email || "").trim().toLowerCase();
-      const password = String(body.password || "");
-      if (!fullName || !validateEmail(email) || !validatePassword(password)) {
-        return sendJson(req, res, 400, { error: `Valid fullName, email, and ${IS_PRODUCTION ? "12+" : "8+"} character password are required` });
+      try {
+        await prisma.$queryRaw`SELECT 1`;
+        return sendJson(req, res, 200, { status: "ok", database: "connected", prisma: "connected" });
+      } catch (error) {
+        return sendJson(req, res, 503, { status: "error", database: "disconnected", prisma: "disconnected" });
       }
-
-      const existing = await prisma.user.findUnique({ where: { email } });
-      if (existing) return sendJson(req, res, 409, { error: "Email already exists" });
-
-      const user = await prisma.user.create({
-        data: {
-          fullName,
-          email,
-          passwordHash: await bcrypt.hash(password, 12),
-          role: "STUDENT",
-          status: "ACTIVE",
-          phone: body.phone ? String(body.phone) : "",
-          country: body.country ? String(body.country) : "",
-          profilePhotoUrl: "",
-        },
-      });
-      const token = signJwt({ sub: user.id, role: user.role });
-      return sendJson(req, res, 201, { user: publicUser(user), token });
-    }
-
-    if (pathname === "/api/auth/login" && req.method === "POST") {
-      const body = await readBody(req);
-      const email = String(body.email || "").trim().toLowerCase();
-      const password = String(body.password || "");
-      const user = await prisma.user.findUnique({ where: { email } });
-      if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
-        return sendJson(req, res, 401, { error: "Invalid email or password" });
-      }
-      if (user.status !== "ACTIVE") {
-        return sendJson(req, res, 403, { error: `Account is ${user.status.toLowerCase()}` });
-      }
-      const token = signJwt({ sub: user.id, role: user.role });
-      return sendJson(req, res, 200, { user: publicUser(user), token });
-    }
-
-    if (pathname === "/api/auth/logout" && req.method === "POST") {
-      const auth = await requireAuth(req, res);
-      if (!auth) return;
-      return sendJson(req, res, 200, { ok: true });
-    }
-
-    if (pathname === "/api/auth/me" && req.method === "GET") {
-      const auth = await requireAuth(req, res);
-      if (!auth) return;
-      return sendJson(req, res, 200, { user: publicUser(auth.user) });
-    }
-
-    if (pathname === "/api/auth/me" && req.method === "PATCH") {
-      const auth = await requireAuth(req, res);
-      if (!auth) return;
-      const body = await readBody(req);
-      const changes = {};
-      if (body.fullName) changes.fullName = String(body.fullName).trim();
-      if (body.phone !== undefined) changes.phone = String(body.phone);
-      if (body.country !== undefined) changes.country = String(body.country);
-      const user = await prisma.user.update({ where: { id: auth.user.id }, data: changes });
-      return sendJson(req, res, 200, { user: publicUser(user) });
     }
 
     if (pathname === "/api/auth/change-password" && req.method === "POST") {
@@ -295,6 +317,42 @@ async function handleApi(req, res, pathname) {
 
     if (pathname === "/api/auth/reset-password" && req.method === "POST") {
       return sendJson(req, res, 501, { error: "Password reset delivery is not configured yet" });
+    }
+
+    if (pathname === "/api/admin/dashboard-data" && req.method === "GET") {
+      const auth = await requireRole(req, res, ["ADMIN"]);
+      if (!auth) return;
+      const [users, courses] = await Promise.all([
+        prisma.user.findMany({ orderBy: { createdAt: "desc" } }),
+        dashboardCourses(),
+      ]);
+      const safeUsers = users.map(publicUser);
+      return sendJson(req, res, 200, {
+        users: safeUsers,
+        courses,
+        progressRecords: courses.flatMap((course) => course.progress || []),
+        summary: dashboardSummary(safeUsers, courses),
+      });
+    }
+
+    if (pathname === "/api/instructor/dashboard-data" && req.method === "GET") {
+      const auth = await requireRole(req, res, ["INSTRUCTOR"]);
+      if (!auth) return;
+      const courses = await dashboardCourses({ createdBy: auth.user.id });
+      const studentsById = new Map();
+      courses.forEach((course) => {
+        (course.enrollments || []).forEach((enrollment) => {
+          if (enrollment.student) studentsById.set(enrollment.student.id, enrollment.student);
+        });
+      });
+      const users = [publicUser(auth.user), ...Array.from(studentsById.values())];
+      return sendJson(req, res, 200, {
+        users,
+        students: Array.from(studentsById.values()),
+        courses,
+        progressRecords: courses.flatMap((course) => course.progress || []),
+        summary: dashboardSummary(users, courses),
+      });
     }
 
     if (pathname === "/api/users" && req.method === "GET") {
@@ -327,6 +385,18 @@ async function handleApi(req, res, pathname) {
         },
       });
       return sendJson(req, res, 201, { user: publicUser(user), createdBy: auth.user.id });
+    }
+
+    const statusMatch = pathname.match(/^\/api\/users\/([^/]+)\/status$/);
+    if (statusMatch && req.method === "PATCH") {
+      const auth = await requireRole(req, res, ["ADMIN"]);
+      if (!auth) return;
+      const body = await readBody(req);
+      const updated = await prisma.user.update({
+        where: { id: decodeURIComponent(statusMatch[1]) },
+        data: { status: normalizeUserStatus(body.status) },
+      });
+      return sendJson(req, res, 200, { user: publicUser(updated) });
     }
 
     const userMatch = pathname.match(/^\/api\/users\/([^/]+)$/);
@@ -427,6 +497,10 @@ async function handleApi(req, res, pathname) {
         data: {
           ...(body.currentModuleId !== undefined ? { currentModuleId: body.currentModuleId ? String(body.currentModuleId) : null } : {}),
           ...(body.currentLessonId !== undefined ? { currentLessonId: body.currentLessonId ? String(body.currentLessonId) : null } : {}),
+          ...(Array.isArray(body.completedLessons) ? { completedLessons: body.completedLessons.map(String) } : {}),
+          ...(Array.isArray(body.completedQuizzes) ? { completedQuizzes: body.completedQuizzes.map(String) } : {}),
+          ...(Array.isArray(body.completedAssignments) ? { completedAssignments: body.completedAssignments.map(String) } : {}),
+          ...(body.progressPercentage !== undefined ? { progressPercentage: Math.max(0, Math.min(100, Number(body.progressPercentage) || 0)) } : {}),
         },
       });
       return sendJson(req, res, 200, { progress });
@@ -452,7 +526,7 @@ async function handleApi(req, res, pathname) {
 
     return sendJson(req, res, 404, { error: "API route not found" });
   } catch (error) {
-    const message = IS_PRODUCTION ? "Request failed" : error.message || "Request failed";
+    const message = isDatabaseConnectionError(error) ? "Database connection failed" : "Request failed";
     return sendJson(req, res, 500, { error: message });
   }
 }
@@ -466,6 +540,12 @@ function serveStatic(req, res, pathname) {
   }
   fs.readFile(normalized, (error, content) => {
     if (error) {
+      if (!path.extname(normalized)) {
+        const indexPath = path.join(ROOT, "index.html");
+        const indexContent = fs.readFileSync(indexPath);
+        res.writeHead(200, { "Content-Type": "text/html", ...securityHeaders(req) });
+        return res.end(indexContent);
+      }
       res.writeHead(404);
       return res.end("Not found");
     }
@@ -490,11 +570,26 @@ server.use((req, res, next) => {
   Object.entries(headers).forEach(([key, value]) => res.setHeader(key, value));
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   if (req.method === "OPTIONS") {
     res.status(204).end();
     return;
   }
   next();
+});
+
+server.use("/api/auth", express.json({ limit: "1mb" }), authRoutes);
+
+server.get("/api/admin/test", authMiddleware, roleMiddleware("ADMIN"), (req, res) => {
+  res.json({ ok: true, role: "ADMIN" });
+});
+
+server.get("/api/instructor/test", authMiddleware, roleMiddleware("INSTRUCTOR"), (req, res) => {
+  res.json({ ok: true, role: "INSTRUCTOR" });
+});
+
+server.get("/api/student/test", authMiddleware, roleMiddleware("STUDENT"), (req, res) => {
+  res.json({ ok: true, role: "STUDENT" });
 });
 
 server.use("/api/content", contentRoutes({ requireAuth }));
@@ -506,6 +601,18 @@ server.use((req, res) => {
     return;
   }
   serveStatic(req, res, url.pathname);
+});
+
+server.use((error, req, res, next) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+  if (isDatabaseConnectionError(error)) {
+    res.status(500).json({ error: "Database connection failed" });
+    return;
+  }
+  res.status(error.statusCode || 500).json({ error: error.message || "Request failed" });
 });
 
 server.listen(PORT, HOST, () => {

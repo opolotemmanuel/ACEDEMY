@@ -11,20 +11,6 @@ function base64Url(input) {
   return Buffer.from(input).toString("base64url");
 }
 
-function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
-  const hash = crypto.pbkdf2Sync(password, salt, 120000, 64, "sha512").toString("hex");
-  return `pbkdf2$${salt}$${hash}`;
-}
-
-function verifyPassword(password, passwordHash) {
-  const [method, salt, expectedHash] = String(passwordHash).split("$");
-  if (method !== "pbkdf2" || !salt || !expectedHash) return false;
-  const actualHash = hashPassword(password, salt).split("$")[2];
-  const actual = Buffer.from(actualHash, "hex");
-  const expected = Buffer.from(expectedHash, "hex");
-  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
-}
-
 function signJwt(payload) {
   const header = { alg: "HS256", typ: "JWT" };
   const now = Math.floor(Date.now() / 1000);
@@ -70,8 +56,6 @@ function publicUser(user) {
 }
 
 module.exports = {
-  hashPassword,
-  verifyPassword,
   signJwt,
   verifyJwt,
   publicUser,

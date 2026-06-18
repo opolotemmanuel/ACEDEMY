@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "check": "node --check app.js && node --check server.js && node --check server/auth.js && node --check backend/src/ai/aiClient.js && node --check backend/src/content/contentRoutes.js && node --check backend/src/prisma.js && node --check src/lib/prisma.js && node --check prisma/seed.js",
+    "check": "node --check app.js && node --check server.js && node --check server/auth.js && node --check src/auth/auth.controller.js && node --check src/auth/auth.middleware.js && node --check src/auth/auth.routes.js && node --check src/auth/auth.service.js && node --check backend/src/ai/aiClient.js && node --check backend/src/content/contentRoutes.js && node --check backend/src/prisma.js && node --check src/lib/prisma.js && node --check prisma/seed.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:seed": "node prisma/seed.js",
@@ -22,5 +22,8 @@
   },
   "devDependencies": {
     "prisma": "^6.19.0"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
   }
 }

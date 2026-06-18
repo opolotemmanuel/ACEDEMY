@@ -106,75 +106,20 @@ const longAnswerReview = {
   status: "Pending review",
 };
 
-function defaultUsers() {
-  const now = new Date().toISOString();
-  return [
-    { id: "usr_admin", fullName: "AQODH Admin", email: "admin@aqodh.academy", passwordHash: demoHash("admin123"), role: "admin", status: "ACTIVE", phone: "+256 700 000 001", profilePhoto: "", createdAt: now, updatedAt: now },
-    { id: "usr_instructor", fullName: "Dr. Miriam Achieng", email: "instructor@aqodh.academy", passwordHash: demoHash("instructor123"), role: "instructor", status: "ACTIVE", phone: "+256 700 000 002", profilePhoto: "", createdAt: now, updatedAt: now },
-    { id: "usr_student", fullName: "Amina Kato", email: "student@aqodh.academy", passwordHash: demoHash("student123"), role: "student", status: "ACTIVE", phone: "+256 700 000 003", profilePhoto: "", createdAt: now, updatedAt: now },
-  ];
-}
-
-function demoHash(password) {
-  return `demo_hash_${btoa(password).replace(/=+$/, "")}`;
-}
-
-function loadUsers() {
-  try {
-    const saved = window.localStorage.getItem("aqodhUsers");
-    return saved ? JSON.parse(saved) : defaultUsers();
-  } catch (error) {
-    return defaultUsers();
-  }
-}
-
-function persistUsers() {
-  try {
-    window.localStorage.setItem("aqodhUsers", JSON.stringify(appState.users));
-  } catch (error) {
-    // Users still update in memory when storage is blocked.
-  }
-}
-
-function loadSession() {
-  try {
-    const saved = window.localStorage.getItem("aqodhSession");
-    return saved ? JSON.parse(saved) : null;
-  } catch (error) {
-    return null;
-  }
-}
-
-function persistSession() {
-  try {
-    if (appState.session) {
-      window.localStorage.setItem("aqodhSession", JSON.stringify(appState.session));
-    } else {
-      window.localStorage.removeItem("aqodhSession");
-    }
-  } catch (error) {
-    // Session still updates in memory when storage is blocked.
-  }
-}
-
 async function apiRequest(path, options = {}) {
   const headers = {
     "Content-Type": "application/json",
     ...(options.headers || {}),
   };
-  if (appState.session && appState.session.token) {
-    headers.Authorization = `Bearer ${appState.session.token}`;
-  }
   let response;
   try {
     response = await fetch(path, {
       ...options,
       headers,
+      credentials: "same-origin",
     });
   } catch (error) {
-    const apiError = new Error("AQODH API server is not available. Falling back to local demo mode.");
-    apiError.apiUnavailable = true;
-    throw apiError;
+    throw new Error("AQODH API server is not available.");
   }
 
   const contentType = response.headers.get("content-type") || "";
@@ -191,10 +136,6 @@ async function apiRequest(path, options = {}) {
   return data;
 }
 
-function shouldUseLocalAuthFallback(error) {
-  return location.protocol === "file:" || error.apiUnavailable;
-}
-
 function upsertUser(user) {
   const existing = appState.users.find((item) => item.id === user.id);
   if (existing) {
@@ -202,7 +143,6 @@ function upsertUser(user) {
   } else {
     appState.users.push(user);
   }
-  persistUsers();
 }
 
 function loadStudentProgress() {
@@ -340,24 +280,60 @@ const appState = {
     instructor: "Dashboard",
     admin: "Dashboard",
   },
-  users: loadUsers(),
-  session: loadSession(),
+  backendCourse: null,
+  backendProgress: null,
+  backendLearningLoading: false,
+  adminDashboardData: null,
+  instructorDashboardData: null,
+  adminDashboardLoading: false,
+  instructorDashboardLoading: false,
+  users: [],
+  session: null,
   authMessage: "",
 };
 
 const app = document.querySelector("#app");
 
-function setView(view) {
+function viewForPath(pathname) {
+  if (pathname === "/student/dashboard") return "student-dashboard";
+  if (pathname === "/instructor/dashboard") return "instructor-dashboard";
+  if (pathname === "/admin/dashboard") return "admin-dashboard";
+  if (pathname === "/login") return "login";
+  if (pathname === "/register") return "register";
+  if (pathname === "/profile") return "profile";
+  if (pathname.startsWith("/certificates/verify/")) return "certificate-verify";
+  return "home";
+}
+
+function pathForView(view) {
+  const paths = {
+    home: "/",
+    login: "/login",
+    register: "/register",
+    profile: "/profile",
+    "student-dashboard": "/student/dashboard",
+    "instructor-dashboard": "/instructor/dashboard",
+    "admin-dashboard": "/admin/dashboard",
+  };
+  return paths[view] || "/";
+}
+
+function setView(view, options = {}) {
   const protectedRole = protectedRouteRole(view);
   if (protectedRole && !canAccessRole(protectedRole)) {
     appState.authMessage = `Please log in as ${protectedRole} to access this dashboard.`;
     appState.view = "login";
+    if (!options.skipHistory) window.history.pushState({}, "", "/login");
     appState.sidebarOpen = false;
     render();
     window.scrollTo({ top: 0, behavior: "smooth" });
     return;
   }
   appState.view = view;
+  if (!options.skipHistory) {
+    const path = pathForView(view);
+    if (window.location.pathname !== path) window.history.pushState({}, "", path);
+  }
   appState.sidebarOpen = false;
   render();
   window.scrollTo({ top: 0, behavior: "smooth" });
@@ -387,13 +363,62 @@ function currentUser() {
   return appState.session ? appState.users.find((user) => user.id === appState.session.userId) : null;
 }
 
+function normalizeBackendCourse(courseData) {
+  if (!courseData) return null;
+  return {
+    ...courseData,
+    duration: courseData.duration || `${courseData.durationWeeks || 0} weeks`,
+    level: courseData.level || "",
+    mode: courseData.mode || "Online",
+    certificate: courseData.certificate ?? true,
+    progress: courseData.progressPercentage || 0,
+    modules: (courseData.modules || []).map((module) => ({
+      ...module,
+      assessment: module.description || "No backend assignment configured yet.",
+      status: String(module.status || "DRAFT").toLowerCase(),
+      lessons: (module.lessons || []).map((lesson) => ({
+        ...lesson,
+        title: lesson.title,
+        description: lesson.description || lesson.content || `${lesson.title} in ${module.title}.`,
+        type: lesson.lessonType || "TEXT",
+      })),
+    })),
+  };
+}
+
+function backendCourseList(role = "admin") {
+  const data = role === "instructor" ? appState.instructorDashboardData : appState.adminDashboardData;
+  return (data?.courses || []).map(normalizeBackendCourse);
+}
+
+function backendPrimaryCourse(role = "admin") {
+  return backendCourseList(role)[0] || null;
+}
+
+function emptyBackendState(title, detail) {
+  return `<div class="empty-state"><h2>${title}</h2><p class="muted">${detail}</p></div>`;
+}
+
 function canAccessRole(role) {
   const user = currentUser();
   return Boolean(user && user.role === role && user.status === "ACTIVE");
 }
 
 function redirectByRole(role) {
-  setView(`${role}-dashboard`);
+  setView(`${role.toLowerCase()}-dashboard`);
+}
+
+async function restoreCurrentUser() {
+  try {
+    const data = await apiRequest("/api/auth/me");
+    upsertUser(data.user);
+    appState.session = { userId: data.user.id, createdAt: new Date().toISOString() };
+    appState.role = data.user.role;
+    return data.user;
+  } catch (error) {
+    appState.session = null;
+    return null;
+  }
 }
 
 function activeDashboardSection(role, fallback = "Dashboard") {
@@ -414,14 +439,13 @@ function setDashboardSection(role, item) {
 
 async function logout() {
   try {
-    if (appState.session && appState.session.token) {
+    if (appState.session) {
       await apiRequest("/api/auth/logout", { method: "POST", body: "{}" });
     }
   } catch (error) {
-    // Local fallback still clears the session.
+    // The local session is still cleared when the server cannot be reached.
   }
   appState.session = null;
-  persistSession();
   appState.authMessage = "You have logged out.";
   setView("login");
 }
@@ -438,85 +462,16 @@ async function loginUser(event) {
       body: JSON.stringify({ email, password }),
     });
     upsertUser(data.user);
-    appState.session = { userId: data.user.id, token: data.token, createdAt: new Date().toISOString() };
+    appState.session = { userId: data.user.id, createdAt: new Date().toISOString() };
     appState.role = data.user.role;
     appState.authMessage = "";
-    persistSession();
     redirectByRole(data.user.role);
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
-  }
-
-  const user = appState.users.find((item) => item.email.toLowerCase() === email);
-
-  if (!user || user.passwordHash !== demoHash(password)) {
-    appState.authMessage = "Invalid email or password.";
+    appState.authMessage = error.message;
     render();
     return;
   }
-  if (user.status !== "ACTIVE") {
-    appState.authMessage = `Your account is ${user.status.toLowerCase()}. Contact admin.`;
-    render();
-    return;
-  }
-
-  appState.session = {
-    userId: user.id,
-    token: `demo_jwt_${Date.now()}`,
-    createdAt: new Date().toISOString(),
-  };
-  appState.role = user.role;
-  appState.authMessage = "";
-  persistSession();
-  redirectByRole(user.role);
-}
-
-async function loginDemo(role) {
-  const emailByRole = {
-    student: "student@aqodh.academy",
-    instructor: "instructor@aqodh.academy",
-    admin: "admin@aqodh.academy",
-  };
-  const passwordByRole = {
-    student: "student123",
-    instructor: "instructor123",
-    admin: "admin123",
-  };
-  try {
-    const data = await apiRequest("/api/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ email: emailByRole[role], password: passwordByRole[role] }),
-    });
-    upsertUser(data.user);
-    appState.session = { userId: data.user.id, token: data.token, createdAt: new Date().toISOString() };
-    appState.role = data.user.role;
-    appState.authMessage = "";
-    persistSession();
-    redirectByRole(data.user.role);
-    return;
-  } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
-  }
-  const user = appState.users.find((item) => item.email === emailByRole[role]);
-  if (!user) return;
-  appState.session = {
-    userId: user.id,
-    token: `demo_jwt_${Date.now()}`,
-    createdAt: new Date().toISOString(),
-  };
-  appState.role = user.role;
-  appState.authMessage = "";
-  persistSession();
-  redirectByRole(user.role);
 }
 
 async function registerUser(event) {
@@ -534,61 +489,29 @@ async function registerUser(event) {
       }),
     });
     upsertUser(data.user);
-    appState.session = { userId: data.user.id, token: data.token, createdAt: new Date().toISOString() };
+    appState.session = { userId: data.user.id, createdAt: new Date().toISOString() };
     appState.role = data.user.role;
-    appState.authMessage = data.verificationToken ? `Demo email verification token: ${data.verificationToken}` : "";
-    persistSession();
+    appState.authMessage = "";
     redirectByRole(data.user.role);
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
-  }
-
-  if (appState.users.some((user) => user.email.toLowerCase() === email)) {
-    appState.authMessage = "An account with this email already exists.";
+    appState.authMessage = error.message;
     render();
     return;
   }
-
-  const now = new Date().toISOString();
-  const user = {
-    id: `usr_${Date.now()}`,
-    fullName: form.fullName.value.trim(),
-    email,
-    passwordHash: demoHash(form.password.value),
-    role: "student",
-    status: "ACTIVE",
-    phone: "",
-    profilePhoto: "",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appState.users.push(user);
-  persistUsers();
-  appState.session = { userId: user.id, token: `demo_jwt_${Date.now()}`, createdAt: now };
-  appState.role = "student";
-  appState.authMessage = "";
-  persistSession();
-  redirectByRole("student");
 }
 
 async function requestPasswordReset(event) {
   event.preventDefault();
   const form = event.currentTarget;
   try {
-    const data = await apiRequest("/api/auth/forgot-password", {
+    await apiRequest("/api/auth/forgot-password", {
       method: "POST",
       body: JSON.stringify({ email: form.email.value.trim().toLowerCase() }),
     });
-    appState.authMessage = data.resetToken
-      ? `Demo reset token: ${data.resetToken}`
-      : "If the email exists, a reset link was generated.";
+    appState.authMessage = "If the email exists, a reset link will be sent.";
   } catch (error) {
-    appState.authMessage = "Password reset link generated for this V1 demo. Use Reset Password to set a new password.";
+    appState.authMessage = error.message;
   }
   render();
 }
@@ -611,18 +534,8 @@ async function resetPassword(event) {
       return;
     }
   }
-  const email = form.email.value.trim().toLowerCase();
-  const user = appState.users.find((item) => item.email.toLowerCase() === email);
-  if (!user) {
-    appState.authMessage = "No user found for that email.";
-    render();
-    return;
-  }
-  user.passwordHash = demoHash(form.password.value);
-  user.updatedAt = new Date().toISOString();
-  persistUsers();
-  appState.authMessage = "Password reset. Please log in.";
-  setView("login");
+  appState.authMessage = "A reset token is required.";
+  render();
 }
 
 async function requestEmailVerification() {
@@ -630,7 +543,7 @@ async function requestEmailVerification() {
     const data = await apiRequest("/api/auth/resend-verification", { method: "POST", body: "{}" });
     appState.authMessage = data.alreadyVerified
       ? "Email is already verified."
-      : `Demo email verification token: ${data.verificationToken}`;
+      : "Verification email requested.";
   } catch (error) {
     appState.authMessage = error.message;
   }
@@ -672,18 +585,10 @@ async function updateProfile(event) {
     render();
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
+    appState.authMessage = error.message;
+    render();
+    return;
   }
-  user.fullName = form.fullName.value.trim();
-  user.phone = form.phone.value.trim();
-  user.updatedAt = new Date().toISOString();
-  persistUsers();
-  appState.authMessage = "Profile updated.";
-  render();
 }
 
 async function changeOwnPassword(event) {
@@ -703,22 +608,10 @@ async function changeOwnPassword(event) {
     render();
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
-  }
-  if (user.passwordHash !== demoHash(form.currentPassword.value)) {
-    appState.authMessage = "Current password is incorrect.";
+    appState.authMessage = error.message;
     render();
     return;
   }
-  user.passwordHash = demoHash(form.newPassword.value);
-  user.updatedAt = new Date().toISOString();
-  persistUsers();
-  appState.authMessage = "Password changed.";
-  render();
 }
 
 async function createInstructor(event) {
@@ -737,37 +630,15 @@ async function createInstructor(event) {
       }),
     });
     upsertUser(data.user);
+    appState.adminDashboardData = null;
     appState.authMessage = "Instructor created with pending status.";
     render();
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
-  }
-  if (appState.users.some((user) => user.email.toLowerCase() === email)) {
-    appState.authMessage = "That instructor email already exists.";
+    appState.authMessage = error.message;
     render();
     return;
   }
-  const now = new Date().toISOString();
-  appState.users.push({
-    id: `usr_${Date.now()}`,
-    fullName: form.fullName.value.trim(),
-    email,
-    passwordHash: demoHash(form.password.value),
-    role: "instructor",
-    status: "PENDING",
-    phone: "",
-    profilePhoto: "",
-    createdAt: now,
-    updatedAt: now,
-  });
-  persistUsers();
-  appState.authMessage = "Instructor created with pending status.";
-  render();
 }
 
 async function updateUserStatus(userId, status) {
@@ -777,21 +648,14 @@ async function updateUserStatus(userId, status) {
       body: JSON.stringify({ status }),
     });
     upsertUser(data.user);
+    appState.adminDashboardData = null;
     render();
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
+    appState.authMessage = error.message;
+    render();
+    return;
   }
-  const user = appState.users.find((item) => item.id === userId);
-  if (!user) return;
-  user.status = status;
-  user.updatedAt = new Date().toISOString();
-  persistUsers();
-  render();
 }
 
 async function changeUserRole(userId, role) {
@@ -801,21 +665,14 @@ async function changeUserRole(userId, role) {
       body: JSON.stringify({ role }),
     });
     upsertUser(data.user);
+    appState.adminDashboardData = null;
     render();
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
+    appState.authMessage = error.message;
+    render();
+    return;
   }
-  const user = appState.users.find((item) => item.id === userId);
-  if (!user) return;
-  user.role = role;
-  user.updatedAt = new Date().toISOString();
-  persistUsers();
-  render();
 }
 
 async function resetUserPassword(userId) {
@@ -825,24 +682,15 @@ async function resetUserPassword(userId) {
       body: JSON.stringify({ password: "Password123" }),
     });
     upsertUser(data.user);
+    appState.adminDashboardData = null;
     appState.authMessage = `${data.user.fullName}'s password reset to Password123.`;
     render();
     return;
   } catch (error) {
-    if (!shouldUseLocalAuthFallback(error)) {
-      appState.authMessage = error.message;
-      render();
-      return;
-    }
+    appState.authMessage = error.message;
+    render();
+    return;
   }
-  const user = appState.users.find((item) => item.id === userId);
-  if (!user) return;
-  user.passwordHash = demoHash("Password123");
-  user.updatedAt = new Date().toISOString();
-  appState.authMessage = `${user.fullName}'s password reset to Password123.`;
-  persistUsers();
-  appState.sidebarOpen = false;
-  render();
 }
 
 function toggleSidebar() {
@@ -851,23 +699,24 @@ function toggleSidebar() {
 }
 
 async function enroll() {
-  if (appState.session?.token && currentUser()?.role === "student") {
+  if (appState.session && currentUser()?.role === "student") {
     try {
-      const data = await apiRequest("/api/enrollments", { method: "POST", body: JSON.stringify({}) });
-      applyServerLearningState(data);
-      appState.enrolled = true;
-      setView("student-dashboard");
-      return;
-    } catch (error) {
-      if (!shouldUseLocalAuthFallback(error)) {
-        appState.authMessage = error.message;
-        render();
+      const catalog = await apiRequest("/api/courses");
+      const selectedCourse = catalog.courses?.[0];
+      if (selectedCourse) {
+        const enrollment = await apiRequest("/api/enrollments", { method: "POST", body: JSON.stringify({ courseId: selectedCourse.id }) });
+        applyBackendLearningState(enrollment);
+        appState.enrolled = true;
+        setView("student-dashboard");
         return;
       }
+    } catch (error) {
+      appState.authMessage = error.message;
+      render();
+      return;
     }
   }
-  appState.enrolled = true;
-  setView("register");
+  setView("login");
 }
 
 function unlockCertificate() {
@@ -879,20 +728,52 @@ function unlockCertificate() {
 
 async function continueLearning() {
   appState.view = "student-dashboard";
-  if (appState.session?.token) {
+  if (appState.session) {
     try {
-      const data = await apiRequest("/api/student/learning-state");
-      applyServerLearningState(data);
+      const contentData = await apiRequest("/api/student/learning-state");
+      applyBackendLearningState(contentData);
+      render();
+      return;
     } catch (error) {
-      if (!shouldUseLocalAuthFallback(error)) {
-        appState.authMessage = error.message;
-      }
-      appState.studentProgress = fetchCurrentLearningState();
+      appState.authMessage = error.message;
     }
   } else {
     appState.studentProgress = fetchCurrentLearningState();
   }
   render();
+}
+
+function ensureBackendLearningLoaded() {
+  if (!appState.session || currentUser()?.role !== "student" || appState.backendCourse || appState.backendLearningLoading) return;
+  appState.backendLearningLoading = true;
+  apiRequest("/api/student/learning-state")
+    .then((data) => {
+      applyBackendLearningState(data);
+      appState.backendLearningLoading = false;
+      render();
+    })
+    .catch(() => {
+      appState.backendLearningLoading = false;
+    });
+}
+
+function ensureDashboardDataLoaded(role) {
+  const key = role === "admin" ? "adminDashboardData" : "instructorDashboardData";
+  const loadingKey = role === "admin" ? "adminDashboardLoading" : "instructorDashboardLoading";
+  if (!appState.session || currentUser()?.role !== role || appState[key] || appState[loadingKey]) return;
+  appState[loadingKey] = true;
+  apiRequest(`/api/${role}/dashboard-data`)
+    .then((data) => {
+      appState[key] = data;
+      (data.users || []).forEach(upsertUser);
+      appState[loadingKey] = false;
+      render();
+    })
+    .catch((error) => {
+      appState.authMessage = error.message;
+      appState[loadingKey] = false;
+      render();
+    });
 }
 
 function fetchCurrentLearningState() {
@@ -938,20 +819,156 @@ function applyServerLearningState(data) {
   }
 }
 
+function applyBackendLearningState(data) {
+  appState.backendCourse = normalizeBackendCourse(data.course) || null;
+  appState.backendProgress = data.progress || null;
+  if (!data.progress || !data.course) return;
+
+  const completedActivities = backendCompletedActivityKeys(data.course, data.progress);
+  const activeModuleId = data.progress.currentModuleId || data.progress.activeModuleId;
+  const activeLessonId = data.progress.currentLessonId || data.progress.activeLessonId;
+  const activeModule = Math.max(0, appState.backendCourse.modules.findIndex((module) => module.id === activeModuleId));
+  const moduleData = appState.backendCourse.modules[activeModule] || appState.backendCourse.modules[0];
+  const activeLesson = moduleData ? Math.max(0, moduleData.lessons.findIndex((lesson) => lesson.id === activeLessonId)) : 0;
+  appState.studentProgress = {
+    ...appState.studentProgress,
+    activeModule,
+    activeLesson,
+    activeActivity: activeLesson >= 0 ? `lesson:${activeLesson}` : "lesson:0",
+    completedActivities,
+    progress: Math.round(Number(data.progress.progressPercentage ?? data.progress.progressPercent ?? 0)),
+  };
+  if (Number.isFinite(Number(data.progress.finalGrade))) {
+    appState.certificateSettings.finalGrade = Number(data.progress.finalGrade);
+    persistCertificateSettings();
+  }
+  persistStudentProgress();
+}
+
+function backendCompletedActivityKeys(courseData, progress) {
+  const keys = [];
+  const completedLessons = new Set(progress.completedLessons || progress.completedLessonIds || []);
+  const completedQuizzes = new Set(progress.completedQuizzes || progress.completedQuizIds || []);
+  const completedAssignments = new Set(progress.completedAssignments || progress.completedAssignmentIds || []);
+  (courseData.modules || []).forEach((module, moduleIndex) => {
+    (module.lessons || []).forEach((lesson, index) => {
+      if (completedLessons.has(lesson.id)) keys.push(`${moduleIndex}:lesson:${index}`);
+    });
+    (module.quizzes || []).forEach((quiz, index) => {
+      if (completedQuizzes.has(quiz.id)) keys.push(`${moduleIndex}:quiz:${index}`);
+    });
+    (module.assignments || []).forEach((assignment, index) => {
+      if (completedAssignments.has(assignment.id)) keys.push(`${moduleIndex}:assignment:${index}`);
+    });
+  });
+  return keys;
+}
+
+function backendProgressPayload() {
+  const courseData = appState.backendCourse;
+  if (!courseData) {
+    return {
+      courseId: null,
+      activeModuleId: null,
+      activeLessonId: null,
+      completedLessonIds: [],
+      completedQuizIds: [],
+      completedAssignmentIds: [],
+    };
+  }
+  const completedLessonIds = [];
+  const completedQuizIds = [];
+  const completedAssignmentIds = [];
+  (appState.studentProgress.completedActivities || []).forEach((key) => {
+    const [moduleIndexValue, type, itemIndexValue] = key.split(":");
+    const data = fetchModuleLearningData(Number(moduleIndexValue));
+    const index = Number(itemIndexValue);
+    if (type === "lesson" && data.lessons[index]?.id) completedLessonIds.push(data.lessons[index].id);
+    if (type === "quiz" && data.quizzes[index]?.id) completedQuizIds.push(data.quizzes[index].id);
+    if (type === "assignment" && data.assignments[index]?.id) completedAssignmentIds.push(data.assignments[index].id);
+  });
+  const activeModule = courseData.modules[appState.studentProgress.activeModule] || courseData.modules[0];
+  const activeData = fetchModuleLearningData(appState.studentProgress.activeModule);
+  const [type, indexValue] = appState.studentProgress.activeActivity.split(":");
+  const activeLesson = type === "lesson" ? activeData.lessons[Number(indexValue)] : null;
+  return {
+    courseId: courseData.id,
+    activeModuleId: activeModule?.id || null,
+    activeLessonId: activeLesson?.id || null,
+    completedLessonIds,
+    completedQuizIds,
+    completedAssignmentIds,
+  };
+}
+
 async function syncServerLearningCursor() {
-  if (!appState.session?.token) return;
+  if (!appState.session) return;
+  const payload = backendProgressPayload();
+  if (!payload.courseId) return;
   const progress = appState.studentProgress;
   await apiRequest("/api/student/learning-state", {
     method: "PATCH",
     body: JSON.stringify({
-      activeModule: progress.activeModule,
-      activeLesson: progress.activeLesson,
-      activeActivity: progress.activeActivity,
+      currentModuleId: payload.activeModuleId,
+      currentLessonId: payload.activeLessonId,
+      completedLessons: payload.completedLessonIds,
+      completedQuizzes: payload.completedQuizIds,
+      completedAssignments: payload.completedAssignmentIds,
+      progressPercentage: progress.progress,
     }),
   });
 }
 
 function fetchModuleLearningData(moduleIndex) {
+  if (appState.backendCourse?.modules?.[moduleIndex]) {
+    const module = appState.backendCourse.modules[moduleIndex];
+    const files = (module.lessons || []).flatMap((lesson) => (lesson.files || []).map((file) => ({
+      id: file.id,
+      title: file.title,
+      type: file.fileType,
+      size: `${Math.max(1, Math.round((file.sizeBytes || 0) / 1024))} KB`,
+      url: `/${file.storagePath}`,
+    })));
+    const videos = (module.lessons || []).flatMap((lesson) => (lesson.videos || []).map((video) => ({
+      id: video.id,
+      title: video.title,
+      provider: video.provider,
+      duration: video.duration || "Self-paced",
+      url: video.videoUrl,
+    })));
+    return {
+      module: {
+        id: module.id,
+        title: module.title,
+        assessment: module.assessment || module.description || "No backend assignment configured yet.",
+        status: String(module.status || "PUBLISHED").toLowerCase(),
+        lessons: module.lessons || [],
+      },
+      lessons: (module.lessons || []).map((lesson, index) => ({
+        id: lesson.id,
+        title: lesson.title,
+        description: lesson.description || lesson.content || `${lesson.title} in ${module.title}.`,
+        type: lesson.lessonType || lesson.type || "TEXT",
+        order: lesson.lessonOrder || index + 1,
+      })),
+      documents: files,
+      videos,
+      quizzes: (module.quizzes || []).map((quiz) => ({
+        id: quiz.id,
+        title: quiz.title,
+        questions: quiz.questions?.length || 0,
+        questionsList: quiz.questions || [],
+        passingScore: quiz.passingScore,
+      })),
+      assignments: (module.assignments || []).map((assignment) => ({
+        id: assignment.id,
+        title: assignment.title,
+        due: assignment.dueAt ? new Date(assignment.dueAt).toLocaleDateString() : "Open",
+        submissionType: "Typed answer",
+        instructions: assignment.instructions,
+      })),
+    };
+  }
   const module = course.modules[moduleIndex];
   return {
     module,
@@ -1002,24 +1019,21 @@ function openStudentActivity(activityType, activityIndex) {
 async function completeActiveActivity() {
   const progress = appState.studentProgress;
   const key = `${progress.activeModule}:${progress.activeActivity}`;
-  if (appState.session?.token) {
+  if (appState.session && appState.backendCourse) {
+    if (!progress.completedActivities.includes(key)) {
+      progress.completedActivities.push(key);
+    }
+    progress.progress = calculateStudentProgress();
     try {
-      const data = await apiRequest("/api/student/activities/complete", {
-        method: "POST",
-        body: JSON.stringify({ activityKey: key }),
-      });
-      applyServerLearningState(data);
-      moveToNextActivity();
       await syncServerLearningCursor();
+      moveToNextActivity();
       persistStudentProgress();
       render();
       return;
     } catch (error) {
-      if (!shouldUseLocalAuthFallback(error)) {
-        appState.authMessage = error.message;
-        render();
-        return;
-      }
+      appState.authMessage = error.message;
+      render();
+      return;
     }
   }
   if (!progress.completedActivities.includes(key)) {
@@ -1032,11 +1046,13 @@ async function completeActiveActivity() {
 }
 
 function calculateStudentProgress() {
-  const total = course.modules.reduce((sum, module, index) => {
+  const courseData = appState.backendCourse;
+  if (!courseData) return 0;
+  const total = courseData.modules.reduce((sum, module, index) => {
     const data = fetchModuleLearningData(index);
     return sum + data.lessons.length + data.documents.length + data.videos.length + data.quizzes.length + data.assignments.length;
   }, 0);
-  return Math.round((appState.studentProgress.completedActivities.length / total) * 100);
+  return total ? Math.round((appState.studentProgress.completedActivities.length / total) * 100) : 0;
 }
 
 function moveToNextActivity() {
@@ -1053,7 +1069,8 @@ function moveToNextActivity() {
     return;
   }
 
-  const nextModule = Math.min(progress.activeModule + 1, course.modules.length - 1);
+  const courseData = appState.backendCourse || course;
+  const nextModule = Math.min(progress.activeModule + 1, courseData.modules.length - 1);
   if (nextModule !== progress.activeModule) {
     progress.activeModule = nextModule;
     progress.activeLesson = 0;
@@ -1078,13 +1095,14 @@ function navButton(label, view) {
 
 function shell(content) {
   const isDashboardShell = appState.view.includes("dashboard") || (appState.view === "profile" && currentUser());
+  const user = currentUser();
   document.body.classList.toggle("dashboard-page", isDashboardShell);
   app.innerHTML = `
     <div class="app-shell ${isDashboardShell ? "dashboard-shell" : "public-shell"}">
       <header class="topbar">
         <button class="hamburger" onclick="toggleSidebar()" aria-label="Open sidebar">☰</button>
         <a class="brand" href="#" onclick="setView('home')">
-          <span class="brand-mark"><img src="assets/aqodh-logo.svg" alt="" /></span>
+          <span class="brand-mark"><img src="/assets/aqodh-logo.svg" alt="AQODH Academy logo" /></span>
           <span>AQODH Academy</span>
         </a>
         <label class="header-search" aria-label="Search">
@@ -1094,7 +1112,7 @@ function shell(content) {
           ${navButton("Home", "home")}
           ${navButton("Course", "course")}
           ${navButton("Register", "register")}
-          ${navButton("Verify", "certificate-verify")}
+          ${user?.role === "admin" ? navButton("Verify", "certificate-verify") : ""}
         </nav>
         <div class="user-menu">
           <span class="notify-dot"></span>
@@ -1231,28 +1249,23 @@ function authShell(title, subtitle, body) {
 }
 
 function loginPage() {
-  return authShell("Login", "Use your email and password. Demo accounts: student@aqodh.academy, instructor@aqodh.academy, admin@aqodh.academy. Passwords are student123, instructor123, admin123.", `
+  return authShell("Login", "Use the email and password for your AQODH Academy account.", `
     <form class="form-grid auth-form" onsubmit="loginUser(event)">
-      <label class="full-field">Email<input name="email" type="email" required value="student@aqodh.academy" /></label>
-      <label class="full-field">Password<input name="password" type="password" required value="student123" /></label>
+      <label class="full-field">Email<input name="email" type="email" required autocomplete="email" /></label>
+      <label class="full-field">Password<input name="password" type="password" required autocomplete="current-password" /></label>
       <button class="primary-button" type="submit">Login</button>
       <button class="ghost-button" type="button" onclick="setView('forgot-password')">Forgot Password</button>
       <button class="ghost-button" type="button" onclick="setView('register')">Create Account</button>
     </form>
-    <div class="demo-login-row">
-      <button class="ghost-button" onclick="loginDemo('student')">Demo Student</button>
-      <button class="ghost-button" onclick="loginDemo('instructor')">Demo Instructor</button>
-      <button class="ghost-button" onclick="loginDemo('admin')">Demo Admin</button>
-    </div>
   `);
 }
 
 function registerPage() {
   return authShell("Register", "Create a student account for Ethical Computing Fundamentals.", `
     <form class="form-grid auth-form" onsubmit="registerUser(event)">
-      <label>Full Name<input name="fullName" required value="New Student" /></label>
-      <label>Email<input name="email" type="email" required value="new.student@aqodh.academy" /></label>
-      <label class="full-field">Password<input name="password" type="password" required value="student123" /></label>
+      <label>Full Name<input name="fullName" required autocomplete="name" /></label>
+      <label>Email<input name="email" type="email" required autocomplete="email" /></label>
+      <label class="full-field">Password<input name="password" type="password" required autocomplete="new-password" /></label>
       <button class="primary-button" type="submit">Register</button>
       <button class="ghost-button" type="button" onclick="setView('login')">Login Instead</button>
     </form>
@@ -1260,9 +1273,9 @@ function registerPage() {
 }
 
 function forgotPasswordPage() {
-  return authShell("Forgot Password", "Generate a demo reset flow for an existing account.", `
+  return authShell("Forgot Password", "Request a password reset for an existing account.", `
     <form class="form-grid auth-form" onsubmit="requestPasswordReset(event)">
-      <label class="full-field">Email<input name="email" type="email" required value="student@aqodh.academy" /></label>
+      <label class="full-field">Email<input name="email" type="email" required autocomplete="email" /></label>
       <button class="primary-button" type="submit">Send Reset Link</button>
       <button class="ghost-button" type="button" onclick="setView('reset-password')">Go To Reset</button>
     </form>
@@ -1270,11 +1283,11 @@ function forgotPasswordPage() {
 }
 
 function resetPasswordPage() {
-  return authShell("Reset Password", "Set a new password for a demo account.", `
+  return authShell("Reset Password", "Set a new password with a valid reset token.", `
     <form class="form-grid auth-form" onsubmit="resetPassword(event)">
-      <label>Email<input name="email" type="email" required value="student@aqodh.academy" /></label>
+      <label>Email<input name="email" type="email" required autocomplete="email" /></label>
       <label>Reset Token<input name="resetToken" placeholder="Paste token from Forgot Password" /></label>
-      <label>New Password<input name="password" type="password" required value="student123" /></label>
+      <label>New Password<input name="password" type="password" required autocomplete="new-password" /></label>
       <button class="primary-button" type="submit">Reset Password</button>
       <button class="ghost-button" type="button" onclick="setView('login')">Back To Login</button>
     </form>
@@ -1350,12 +1363,6 @@ function dashboardHeader(title, subtitle) {
         <h1>${title}</h1>
         <p class="muted">${subtitle}</p>
       </div>
-      <div class="role-panel">
-        <span class="label">Role</span>
-        <select onchange="setRole(this.value)" aria-label="Select role">
-          ${["student", "instructor", "admin"].map((role) => `<option value="${role}" ${appState.role === role ? "selected" : ""}>${role}</option>`).join("")}
-        </select>
-      </div>
     </div>
   `;
 }
@@ -1391,9 +1398,20 @@ function dashboardLayout(role, title, subtitle, sidebarItems, content) {
 }
 
 function studentDashboard() {
+  ensureBackendLearningLoaded();
   const user = currentUser();
+  const courseData = appState.backendCourse;
+  if (!courseData) {
+    return dashboardLayout(
+      "Student",
+      "Student Dashboard",
+      "Backend course, enrollment, and progress data",
+      dashboardSidebarItems("student"),
+      `<article class="card data-card">${emptyBackendState(appState.backendLearningLoading ? "Loading course data" : "No backend course data", appState.backendLearningLoading ? "Fetching your enrollment and progress from PostgreSQL." : "The student dashboard only displays course data returned by Prisma.")}</article>`
+    );
+  }
   const progress = appState.certificateUnlocked ? 100 : appState.studentProgress.progress;
-  const activeModule = appState.studentProgress.activeModule;
+  const activeModule = Math.min(appState.studentProgress.activeModule, Math.max(0, courseData.modules.length - 1));
   const moduleData = fetchModuleLearningData(activeModule);
   const sidebar = dashboardSidebarItems("student");
   const section = activeDashboardSection("student");
@@ -1402,7 +1420,7 @@ function studentDashboard() {
       <article class="card data-card welcome-card span-65">
         <span class="label">Welcome</span>
         <h2>Welcome back, ${user ? user.fullName : "Student"}</h2>
-        <p><strong>Course:</strong> ${course.title}</p>
+        <p><strong>Course:</strong> ${courseData.title}</p>
         <p><strong>Current Module:</strong> Module ${activeModule + 1}: ${moduleData.module.title}</p>
         <button class="primary-button" onclick="continueLearning()">Continue Learning</button>
       </article>
@@ -1431,13 +1449,13 @@ function studentDashboard() {
   const courseSection = `
     <article class="card data-card module-stack">
       <div class="split-actions"><span class="label">Course Modules</span><span class="muted">Full course path</span></div>
-      ${course.modules.map((module, index) => `
+      ${courseData.modules.map((module, index) => `
         <div class="module-row">
           <div>
             <h3>Module ${index + 1}: ${module.title}</h3>
             <p class="muted">${module.assessment}</p>
           </div>
-          <span>${module.lessons.length} lessons · ${index === 0 ? "1 quiz" : "1 task"}</span>
+          <span>${module.lessons.length} lessons</span>
           <span class="pill">${index === 0 ? "Completed" : module.status === "active" ? "In progress" : "Locked"}</span>
           <button class="ghost-button" onclick="openStudentModule(${index})">Open Module</button>
         </div>
@@ -1449,19 +1467,12 @@ function studentDashboard() {
     <div class="v1-row">
       <article class="card data-card span-50 task-grade-card">
         <span class="label">Upcoming Tasks</span>
-        ${tasks.map((task) => `
-          <div class="task-line">
-            <div><strong>${task.name}</strong><p class="muted">Due ${task.due} · ${task.state}</p></div>
-            <button class="ghost-button">Submit</button>
-          </div>
-        `).join("")}
+        ${emptyBackendState("No backend tasks yet", "Quizzes and assignments are not in the current Prisma foundation, so no sample tasks are shown here.")}
       </article>
       <article class="card data-card span-50 task-grade-card">
         <span class="label">Grades Summary</span>
-        ${grade("Quiz average", 82)}
-        ${grade("Assignment score", 76)}
-        ${grade("Overall grade", appState.certificateUnlocked ? 88 : 78)}
-        <p><strong>Final project status:</strong> ${appState.certificateUnlocked ? "Passed" : "Not submitted"}</p>
+        ${grade("Final grade", appState.certificateSettings.finalGrade || 0)}
+        <p><strong>Progress record:</strong> ${appState.backendProgress ? "Loaded from PostgreSQL" : "Not available"}</p>
       </article>
     </div>
   `;
@@ -1478,9 +1489,9 @@ function studentDashboard() {
     Dashboard: `${dashboardOverview}${learningSection}${tasksSection}`,
     "My Course": courseSection,
     Lessons: learningSection,
-    Quizzes: `<article class="card data-card"><span class="label">Quizzes</span><h2>Knowledge Checks</h2>${objectiveMarkingRows()}<button class="primary-button" onclick="openStudentActivity('quiz', 0)">Open Active Quiz</button></article>`,
-    Assignments: `<article class="card data-card"><span class="label">Assignments</span>${tasks.map((task) => `<div class="task-line"><div><strong>${task.name}</strong><p class="muted">${task.type} · Due ${task.due} · ${task.state}</p></div><button class="ghost-button">Submit</button></div>`).join("")}</article>`,
-    Grades: `<article class="card data-card task-grade-card"><span class="label">Grades</span>${grade("Quiz average", 82)}${grade("Assignment score", 76)}${grade("Overall grade", appState.certificateUnlocked ? 88 : 78)}</article>`,
+    Quizzes: `<article class="card data-card"><span class="label">Quizzes</span>${emptyBackendState("No backend quizzes yet", "Quiz tables are planned, but are not part of the current Prisma foundation.")}</article>`,
+    Assignments: `<article class="card data-card"><span class="label">Assignments</span>${emptyBackendState("No backend assignments yet", "Assignment tables are planned, but are not part of the current Prisma foundation.")}</article>`,
+    Grades: `<article class="card data-card task-grade-card"><span class="label">Grades</span>${grade("Final grade", appState.certificateSettings.finalGrade || 0)}</article>`,
     Certificate: studentCertificateSection(),
     Announcements: announcementsSection,
   };
@@ -1489,9 +1500,10 @@ function studentDashboard() {
 }
 
 function moduleTabs(activeModule) {
+  const courseData = appState.backendCourse || { modules: [] };
   return `
     <div class="module-tabs" role="tablist" aria-label="Course modules">
-      ${course.modules.map((module, index) => `
+      ${courseData.modules.map((module, index) => `
         <button class="${index === activeModule ? "active" : ""}" onclick="openStudentModule(${index})" role="tab" aria-selected="${index === activeModule}">
           ${index + 1}
         </button>
@@ -1546,13 +1558,16 @@ function renderActivityPanel(activityType, activityIndex, active) {
   const completeButton = `<button class="primary-button" onclick="completeActiveActivity()">${completed ? "Save Progress Again" : "Mark Complete and Save Progress"}</button>`;
 
   if (activityType === "document") {
+    const documentAction = item.url
+      ? `<a class="ghost-button" href="${item.url}" target="_blank" rel="noopener">${item.type === "PPTX" || item.type === "PPT" ? "Download PowerPoint" : "Open Document"}</a>`
+      : `<button class="ghost-button">${item.type === "PPTX" ? "Download PowerPoint" : "Open Document"}</button>`;
     return `
       <span class="label">Document</span>
       <h2>${item.title}</h2>
       <div class="document-viewer">
         <strong>${item.type} learning material</strong>
         <span>${item.size}</span>
-        <button class="ghost-button">${item.type === "PPTX" ? "Download PowerPoint" : "Open Document"}</button>
+        ${documentAction}
       </div>
       <p class="muted">Documents and PowerPoint downloads open inside the student dashboard workspace.</p>
       ${completeButton}
@@ -1563,34 +1578,43 @@ function renderActivityPanel(activityType, activityIndex, active) {
     return `
       <span class="label">Video</span>
       <h2>${item.title}</h2>
-      <div class="video-frame">Embedded ${item.provider} player · ${item.duration}</div>
+      <div class="video-frame">Embedded ${item.provider} player · ${item.duration}${item.url ? `<br><a href="${item.url}" target="_blank" rel="noopener">Open source link</a>` : ""}</div>
       <p class="muted">Video playback remains inside /student/dashboard.</p>
       ${completeButton}
     `;
   }
 
   if (activityType === "quiz") {
+    const firstQuestion = item.questionsList?.[0];
+    const quizSubmit = item.id && firstQuestion
+      ? `<button class="primary-button" onclick="submitActiveQuiz('${item.id}', '${firstQuestion.id}')">Submit Quiz</button>`
+      : completeButton;
     return `
       <span class="label">Quiz</span>
       <h2>${item.title}</h2>
       <p>${item.questions} objective questions · Passing score ${item.passingScore}%</p>
       <div class="quiz-card">
-        <strong>Sample question</strong>
-        <p>What does AI stand for?</p>
-        <label><input type="radio" name="student-quiz" /> Artificial Intelligence</label>
-        <label><input type="radio" name="student-quiz" /> Automated Internet</label>
+        <strong>${firstQuestion ? "Question 1" : "Sample question"}</strong>
+        <p>${firstQuestion ? firstQuestion.prompt : "What does AI stand for?"}</p>
+        ${(firstQuestion?.options || ["Artificial Intelligence", "Automated Internet"]).map((option) => `
+          <label><input type="radio" name="quiz-${item.id || "sample"}" value="${option}" /> ${option}</label>
+        `).join("")}
       </div>
-      ${completeButton}
+      ${quizSubmit}
     `;
   }
 
   if (activityType === "assignment") {
+    const assignmentSubmit = item.id
+      ? `<button class="primary-button" onclick="submitActiveAssignment('${item.id}')">Submit Assignment</button>`
+      : completeButton;
     return `
       <span class="label">Assignment</span>
       <h2>${item.title}</h2>
       <p class="muted">Due ${item.due} · ${item.submissionType}</p>
-      <textarea>Type your response inside the dashboard workspace...</textarea>
-      ${completeButton}
+      ${item.instructions ? `<p>${item.instructions}</p>` : ""}
+      <textarea id="assignment-${item.id || "local"}" placeholder="Type your response inside the dashboard workspace..."></textarea>
+      ${assignmentSubmit}
     `;
   }
 
@@ -1604,6 +1628,45 @@ function renderActivityPanel(activityType, activityIndex, active) {
     </div>
     ${completeButton}
   `;
+}
+
+async function submitActiveQuiz(quizId, questionId) {
+  const selected = document.querySelector(`input[name="quiz-${quizId}"]:checked`);
+  if (!selected) {
+    appState.authMessage = "Choose an answer before submitting the quiz.";
+    render();
+    return;
+  }
+  try {
+    await apiRequest(`/api/content/quizzes/${quizId}/attempts`, {
+      method: "POST",
+      body: JSON.stringify({ answers: { [questionId]: selected.value } }),
+    });
+    await completeActiveActivity();
+  } catch (error) {
+    appState.authMessage = error.message;
+    render();
+  }
+}
+
+async function submitActiveAssignment(assignmentId) {
+  const field = document.querySelector(`#assignment-${assignmentId}`);
+  const content = field ? field.value.trim() : "";
+  if (!content) {
+    appState.authMessage = "Type your assignment response before submitting.";
+    render();
+    return;
+  }
+  try {
+    await apiRequest(`/api/content/assignments/${assignmentId}/submissions`, {
+      method: "POST",
+      body: JSON.stringify({ content }),
+    });
+    await completeActiveActivity();
+  } catch (error) {
+    appState.authMessage = error.message;
+    render();
+  }
 }
 
 function formatActivityLabel(activityKey) {
@@ -1638,54 +1701,10 @@ function evaluateCertificateEligibility() {
 }
 
 function studentCertificateSection() {
-  const eligibility = evaluateCertificateEligibility();
-  const settings = appState.certificateSettings;
-  const record = appState.certificateRecord;
-
-  let action = `<button class="ghost-button" onclick="unlockCertificate()">Simulate 100% Completion</button>`;
-  let status = "Locked";
-  let detail = `Complete the course and score at least ${settings.minimumPassMark}%.`;
-
-  if (record && !settings.certificateRevoked) {
-    status = `Generated (${record.status || "valid"})`;
-    detail = `Certificate ${record.certificateNumber} generated on ${record.completionDate}.`;
-    action = `<button class="primary-button" onclick="openCertificateReview()">Review Certificate</button><button class="ghost-button" onclick="openVerification('${record.certificateNumber}')">Verify</button>`;
-  } else if (eligibility.eligible) {
-    status = "Eligible";
-    detail = "All certificate requirements are met.";
-    action = `<button class="primary-button" onclick="generateCertificate()">Generate Certificate</button>`;
-  } else if (eligibility.reason === "payment") {
-    status = "Payment Required";
-    detail = `Balance due: ${settings.amountDue}.`;
-    action = `<button class="primary-button" onclick="payCertificateBalance()">Pay Balance</button>`;
-  } else if (eligibility.reason === "approval") {
-    status = "Pending Admin Approval";
-    detail = "Your completion is waiting for admin certificate approval.";
-    action = `<span class="pill warning-pill">Pending Admin Approval</span>`;
-  } else if (eligibility.reason === "revoked") {
-    status = "Revoked";
-    detail = "This certificate has been revoked by admin.";
-    action = `<span class="pill danger-pill">Certificate Revoked</span>`;
-  } else if (eligibility.reason === "grade") {
-    status = "Grade Below Pass Mark";
-    detail = `Final grade ${settings.finalGrade}% is below ${settings.minimumPassMark}%.`;
-  }
-
   return `
     <article class="card data-card certificate-engine">
-      <div>
-        <span class="label">Certificate Engine</span>
-        <h2>${status}</h2>
-        <p class="muted">${detail}</p>
-        <div class="certificate-checks">
-          ${certificateCheck("100% completion", eligibility.completionOk)}
-          ${certificateCheck(`Final grade ${settings.finalGrade}%`, eligibility.gradeOk)}
-          ${certificateCheck(settings.courseIsFree ? "Free course" : "Payment complete", eligibility.paymentOk)}
-          ${certificateCheck("Admin approval", eligibility.approvalOk)}
-        </div>
-        ${record ? `<p class="muted">Verification: ${record.verificationUrl}</p>` : ""}
-      </div>
-      <div class="certificate-actions">${action}</div>
+      <span class="label">Certificate Engine</span>
+      ${emptyBackendState("No backend certificates yet", "Certificate eligibility and verification tables are planned, but are not part of the current Prisma foundation.")}
     </article>
   `;
 }
@@ -2429,10 +2448,28 @@ function coursePage() {
 }
 
 function instructorDashboard() {
+  ensureDashboardDataLoaded("instructor");
   const sidebar = dashboardSidebarItems("instructor");
   const active = activeDashboardSection("instructor");
-  const stats = [["Total Students", "120"], ["Total Modules", course.modules.length], ["Pending Submissions", "34"], ["Average Completion", "56%"]];
+  const dashboardData = appState.instructorDashboardData;
+  const courseData = backendPrimaryCourse("instructor");
+  const summary = dashboardData?.summary || {};
+  const stats = [
+    ["Total Students", summary.totalStudents || 0],
+    ["Total Modules", summary.totalModules || 0],
+    ["Total Lessons", summary.totalLessons || 0],
+    ["Average Completion", `${summary.averageProgress || 0}%`],
+  ];
   const longMark = markLongAnswer(longAnswerReview.answer, longAnswerReview.keywords, longAnswerReview.maxMarks);
+  if (!dashboardData) {
+    return dashboardLayout(
+      "Instructor",
+      "Instructor Dashboard",
+      "Courses, modules, lessons, enrollments, and progress from Prisma",
+      sidebar,
+      `<article class="card data-card">${emptyBackendState(appState.instructorDashboardLoading ? "Loading instructor data" : "No instructor backend data", appState.instructorDashboardLoading ? "Fetching your courses and learners from PostgreSQL." : "The instructor dashboard only displays records returned by Prisma.")}</article>`
+    );
+  }
   const content = `
     <div class="v1-row stat-row">${stats.map(([label, value]) => statCard(label, value)).join("")}</div>
 
@@ -2450,12 +2487,12 @@ function instructorDashboard() {
       </article>
       <article class="card data-card span-40 quick-actions">
         <span class="label">Ready Modules</span>
-        ${course.modules.map((module, index) => `
+        ${(courseData?.modules || []).map((module, index) => `
           <div class="structure-line">
             <div><strong>Module ${index + 1}: ${module.title}</strong><p class="muted">${module.lessons.length} lessons · ${index < 3 ? "Published" : "Draft"}</p></div>
             <button class="ghost-button">Edit</button>
           </div>
-        `).join("")}
+        `).join("") || emptyBackendState("No modules yet", "Create modules through the backend before they appear here.")}
       </article>
     </div>
 
@@ -2485,9 +2522,7 @@ function instructorDashboard() {
           <label class="upload-box full-field"><input type="file" /><strong>Drop PDF, PPT, PPTX, or DOC/DOCX here</strong><span>PowerPoint files are stored for download in V1.</span></label>
           <button class="primary-button">Save Document</button>
         </form>
-        <div class="preview-grid">
-          ${documentFiles.map((file) => `<div class="preview-card"><strong>${file.title}</strong><span>${file.type} · ${file.size}</span><small>${file.lesson}</small></div>`).join("")}
-        </div>
+        ${emptyBackendState("No backend documents yet", "Document file tables are not part of the current Prisma foundation.")}
       </article>
     </div>
 
@@ -2507,8 +2542,7 @@ function instructorDashboard() {
       </article>
       <article class="card data-card span-50">
         <span class="label">Video Display</span>
-        <div class="video-frame">Embedded player preview</div>
-        ${videoLessons.map((video) => `<div class="structure-line"><div><strong>${video.title}</strong><p class="muted">${video.provider} · ${video.duration}</p></div><button class="ghost-button">Mark as complete</button></div>`).join("")}
+        ${emptyBackendState("No backend videos yet", "Video tables are not part of the current Prisma foundation.")}
       </article>
     </div>
 
@@ -2536,8 +2570,7 @@ function instructorDashboard() {
       </article>
       <article class="card data-card span-50">
         <span class="label">Auto Marking</span>
-        <h2>Objective marking demo</h2>
-        ${objectiveMarkingRows()}
+        ${emptyBackendState("No backend quizzes yet", "Quiz and attempt tables are planned, but not in the current Prisma foundation.")}
       </article>
     </div>
 
@@ -2560,22 +2593,13 @@ function instructorDashboard() {
       </article>
       <article class="card data-card span-50">
         <span class="label">Review Submission</span>
-        <h2>${longAnswerReview.student}</h2>
-        <p class="answer-box">${longAnswerReview.answer}</p>
-        <div class="keyword-columns">
-          <div><strong>Matched keywords</strong>${keywordList(longMark.matched, "success")}</div>
-          <div><strong>Missing keywords</strong>${keywordList(longMark.missing, "warning")}</div>
-        </div>
-        <p><strong>Auto score:</strong> ${longMark.score}/${longAnswerReview.maxMarks}</p>
-        <label>Instructor score<input type="number" value="${longMark.score}" /></label>
-        <label>Feedback<textarea>Good coverage of the expected ethical AI concepts. Add one concrete example before final grade.</textarea></label>
-        <button class="primary-button">Save Grade</button>
+        ${emptyBackendState("No backend submissions yet", "Assignment submissions are not in the current Prisma foundation.")}
       </article>
     </div>
 
     <article class="card data-card">
       <span class="label">Submissions</span>
-      ${assignmentMarkingTable(longMark.score)}
+      ${submissionsTable()}
     </article>
 
     <article class="card data-card">
@@ -2593,15 +2617,15 @@ function instructorDashboard() {
 
   const sectionContent = {
     Dashboard: content,
-    "My Courses": `<article class="card data-card"><span class="label">My Courses</span><h2>${course.title}</h2>${simpleRows([["Duration", course.duration], ["Modules", course.modules.length], ["Mode", course.mode], ["Certificate", "Enabled"]])}</article>`,
-    Modules: `<article class="card data-card"><span class="label">Modules</span><h2>Course Structure</h2>${course.modules.map((module, index) => `<div class="structure-line"><div><strong>Module ${index + 1}: ${module.title}</strong><p class="muted">${module.assessment}</p></div><button class="ghost-button">Edit</button></div>`).join("")}</article>`,
+    "My Courses": `<article class="card data-card"><span class="label">My Courses</span>${courseData ? `<h2>${courseData.title}</h2>${simpleRows([["Duration", courseData.duration], ["Modules", courseData.modules.length], ["Lessons", summary.totalLessons || 0], ["Status", courseData.status]])}` : emptyBackendState("No courses assigned", "No Prisma courses are linked to this instructor.")}</article>`,
+    Modules: `<article class="card data-card"><span class="label">Modules</span><h2>Course Structure</h2>${(courseData?.modules || []).map((module, index) => `<div class="structure-line"><div><strong>Module ${index + 1}: ${module.title}</strong><p class="muted">${module.assessment}</p></div><button class="ghost-button">Edit</button></div>`).join("") || emptyBackendState("No modules yet", "No Prisma modules are linked to this instructor course.")}</article>`,
     Lessons: `<article class="card data-card"><span class="label">Lessons</span><h2>Add lesson content</h2><form class="form-grid" onsubmit="event.preventDefault();"><label>Select Module${moduleSelect()}</label><label>Lesson Type${optionSelect(lessonTypes)}</label><label class="full-field">Lesson Title<input value="Why ethics matters in technology" /></label><button class="primary-button">Save Lesson</button></form></article>`,
-    Documents: `<article class="card data-card"><span class="label">Documents</span><h2>Document Library</h2><div class="preview-grid">${documentFiles.map((file) => `<div class="preview-card"><strong>${file.title}</strong><span>${file.type} · ${file.size}</span><small>${file.lesson}</small></div>`).join("")}</div></article>`,
-    Videos: `<article class="card data-card"><span class="label">Videos</span><h2>Video Lessons</h2>${videoLessons.map((video) => `<div class="structure-line"><div><strong>${video.title}</strong><p class="muted">${video.provider} · ${video.duration}</p></div><button class="ghost-button">Edit</button></div>`).join("")}</article>`,
-    Quizzes: `<article class="card data-card"><span class="label">Quizzes</span><h2>Objective Marking</h2>${objectiveMarkingRows()}</article>`,
-    Assignments: `<article class="card data-card"><span class="label">Assignments</span><h2>Create long-answer assignment</h2><p class="answer-box">${longAnswerReview.assignment}</p>${keywordList(longAnswerReview.keywords, "success")}</article>`,
-    Submissions: `<article class="card data-card"><span class="label">Submissions</span>${assignmentMarkingTable(longMark.score)}</article>`,
-    Grades: `<article class="card data-card"><span class="label">Grades</span><h2>Grade Review Panel</h2><p><strong>Auto score:</strong> ${longMark.score}/${longAnswerReview.maxMarks}</p><label>Instructor score<input type="number" value="${longMark.score}" /></label><label>Feedback<textarea>Good coverage. Add one concrete example before final grade.</textarea></label><button class="primary-button">Save Grade</button></article>`,
+    Documents: `<article class="card data-card"><span class="label">Documents</span>${emptyBackendState("No backend documents yet", "Document file tables are not part of the current Prisma foundation.")}</article>`,
+    Videos: `<article class="card data-card"><span class="label">Videos</span>${emptyBackendState("No backend videos yet", "Video tables are not part of the current Prisma foundation.")}</article>`,
+    Quizzes: `<article class="card data-card"><span class="label">Quizzes</span>${emptyBackendState("No backend quizzes yet", "Quiz tables are planned, but not in the current Prisma foundation.")}</article>`,
+    Assignments: `<article class="card data-card"><span class="label">Assignments</span>${emptyBackendState("No backend assignments yet", "Assignment tables are planned, but not in the current Prisma foundation.")}</article>`,
+    Submissions: `<article class="card data-card"><span class="label">Submissions</span>${submissionsTable()}</article>`,
+    Grades: `<article class="card data-card"><span class="label">Grades</span>${studentProgressTable()}</article>`,
     Announcements: `<article class="card data-card"><span class="label">Announcements</span><h2>Course Messages</h2>${simpleRows([["Welcome note", "Published to current cohort"], ["Assessment reminder", "Draft"], ["Certificate guidance", "Published"]])}</article>`,
   };
 
@@ -2609,7 +2633,8 @@ function instructorDashboard() {
 }
 
 function moduleSelect() {
-  return `<select>${course.modules.map((module, index) => `<option>Module ${index + 1}: ${module.title}</option>`).join("")}</select>`;
+  const courseData = appState.backendCourse || backendPrimaryCourse("instructor") || backendPrimaryCourse("admin") || course;
+  return `<select>${(courseData.modules || []).map((module, index) => `<option>Module ${index + 1}: ${module.title}</option>`).join("")}</select>`;
 }
 
 function optionSelect(options) {
@@ -2679,23 +2704,38 @@ function assignmentMarkingTable(autoScore) {
 }
 
 function adminDashboard() {
+  ensureDashboardDataLoaded("admin");
   const sidebar = dashboardSidebarItems("admin");
   const active = activeDashboardSection("admin");
-  const stats = [["Total Users", "250"], ["Total Students", "210"], ["Revenue", "UGX 5,250,000"], ["Certificates", "45"]];
+  const dashboardData = appState.adminDashboardData;
+  const summary = dashboardData?.summary || {};
+  const courses = backendCourseList("admin");
+  const stats = [
+    ["Total Users", summary.totalUsers || 0],
+    ["Total Students", summary.totalStudents || 0],
+    ["Total Courses", summary.totalCourses || 0],
+    ["Enrollments", summary.totalEnrollments || 0],
+  ];
+  if (!dashboardData) {
+    return dashboardLayout(
+      "Admin",
+      "Admin Dashboard",
+      "Users, courses, enrollments, and progress from Prisma",
+      sidebar,
+      `<article class="card data-card">${emptyBackendState(appState.adminDashboardLoading ? "Loading admin data" : "No admin backend data", appState.adminDashboardLoading ? "Fetching users, courses, enrollments, and progress from PostgreSQL." : "The admin dashboard only displays records returned by Prisma.")}</article>`
+    );
+  }
   const content = `
     <div class="v1-row stat-row">${stats.map(([label, value]) => statCard(label, value)).join("")}</div>
     <div class="v1-row analytics-row">
       <article class="card data-card span-60">
-        <span class="label">Enrollment Chart</span>
-        <h2>Monthly enrollments</h2>
-        <div class="bar-chart">
-          ${[34, 48, 63, 57, 82, 96].map((height, index) => `<span style="height:${height}%"><em>${["Jan", "Feb", "Mar", "Apr", "May", "Jun"][index]}</em></span>`).join("")}
-        </div>
+        <span class="label">Course Foundation</span>
+        <h2>PostgreSQL records</h2>
+        ${simpleRows([["Courses", summary.totalCourses || 0], ["Modules", summary.totalModules || 0], ["Lessons", summary.totalLessons || 0], ["Active enrollments", summary.activeEnrollments || 0]])}
       </article>
       <article class="card data-card span-40 revenue-card">
-        <span class="label">Revenue</span>
-        <h2>UGX 5,250,000</h2>
-        ${simpleRows([["Pending payments", "18"], ["Completed payments", "142"], ["Failed payments", "5"]])}
+        <span class="label">Payments</span>
+        ${paymentsTable()}
       </article>
     </div>
     <div class="v1-row recent-row">
@@ -2753,26 +2793,27 @@ function adminDashboard() {
 
   const sectionContent = {
     Dashboard: content,
-    "AI Insights": aiCommandCenter(),
+    "AI Insights": `<article class="card data-card"><span class="label">AI Insights</span>${emptyBackendState("No backend AI insights yet", "AI insights are planned, but are not part of the current Prisma foundation.")}</article>`,
     Users: userManagement,
-    Courses: `<article class="card data-card"><span class="label">Courses</span><h2>${course.title}</h2>${simpleRows([["Modules", course.modules.length], ["Mode", course.mode], ["Certificate", "Enabled"], ["Pricing", appState.certificateSettings.courseIsFree ? "Free" : "Paid"]])}</article>`,
-    Instructors: `<article class="card data-card"><span class="label">Instructors</span>${adminUsersTable()}</article>`,
+    Courses: `<article class="card data-card"><span class="label">Courses</span>${courses.map((courseItem) => `<div class="structure-line"><div><strong>${courseItem.title}</strong><p class="muted">${courseItem.description || "No description"} · ${courseItem.status}</p></div><span class="pill">${courseItem.modules.length} modules</span></div>`).join("") || emptyBackendState("No backend courses found", "Seed or create courses before they appear here.")}</article>`,
+    Instructors: `<article class="card data-card"><span class="label">Instructors</span>${adminUsersTable("instructor")}</article>`,
     Students: `<article class="card data-card"><span class="label">Students</span>${studentProgressTable()}</article>`,
     Payments: `<article class="card data-card"><span class="label">Payments</span>${paymentsTable()}</article>`,
     Certificates: `<article class="card data-card"><span class="label">Certificates Approval</span>${certificatesTable()}</article><article class="card data-card"><span class="label">Certificate Engine Settings</span>${adminCertificateControls()}</article>`,
-    Reports: `<article class="card data-card"><span class="label">Reports</span><h2>System Reports</h2>${simpleRows([["Total users", "250"], ["Total students", "210"], ["Certificates issued", "45"], ["Pending payments", "18"]])}</article>`,
+    Reports: `<article class="card data-card"><span class="label">Reports</span><h2>System Reports</h2>${simpleRows([["Total users", summary.totalUsers || 0], ["Total students", summary.totalStudents || 0], ["Total instructors", summary.totalInstructors || 0], ["Total courses", summary.totalCourses || 0], ["Average progress", `${summary.averageProgress || 0}%`]])}</article>`,
     Settings: `<article class="card data-card"><span class="label">Settings</span>${adminCertificateControls()}</article>`,
   };
 
   return dashboardLayout("Admin", "Admin Dashboard", "Stats → Enrollment Analytics → Revenue → Users → Payments → Certificates", sidebar, sectionContent[active] || content);
 }
 
-function adminUsersTable() {
+function adminUsersTable(roleFilter = "") {
+  const users = roleFilter ? appState.users.filter((user) => user.role === roleFilter) : appState.users;
   return `
     <div class="table-wrap"><table>
       <thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Updated</th><th>Actions</th></tr></thead>
       <tbody>
-        ${appState.users.map((user) => `
+        ${users.map((user) => `
           <tr>
             <td><strong>${user.fullName}</strong></td>
             <td>${user.email}</td>
@@ -2789,81 +2830,14 @@ function adminUsersTable() {
               <button class="ghost-button table-button" onclick="resetUserPassword('${user.id}')">Reset Password</button>
             </td>
           </tr>
-        `).join("")}
+        `).join("") || `<tr><td colspan="6">No backend users found.</td></tr>`}
       </tbody>
     </table></div>
   `;
 }
 
 function adminCertificateControls() {
-  const settings = appState.certificateSettings;
-  const record = appState.certificateRecord;
-
-  return `
-    <div class="certificate-admin-grid">
-      <label>Course pricing
-        <select onchange="updateCertificateSetting('courseIsFree', this.value)">
-          <option value="false" ${!settings.courseIsFree ? "selected" : ""}>Paid course</option>
-          <option value="true" ${settings.courseIsFree ? "selected" : ""}>Free course</option>
-        </select>
-      </label>
-      <label>Require full payment
-        <select onchange="updateCertificateSetting('requireFullPayment', this.value)">
-          <option value="true" ${settings.requireFullPayment ? "selected" : ""}>Required</option>
-          <option value="false" ${!settings.requireFullPayment ? "selected" : ""}>Not required</option>
-        </select>
-      </label>
-      <label>Payment status
-        <select onchange="updateCertificateSetting('paymentStatus', this.value)">
-          <option value="balance_due" ${settings.paymentStatus === "balance_due" ? "selected" : ""}>Balance due</option>
-          <option value="paid" ${settings.paymentStatus === "paid" ? "selected" : ""}>Paid</option>
-        </select>
-      </label>
-      <label>Manual approval
-        <select onchange="updateCertificateSetting('requireManualApproval', this.value)">
-          <option value="true" ${settings.requireManualApproval ? "selected" : ""}>Required</option>
-          <option value="false" ${!settings.requireManualApproval ? "selected" : ""}>Not required</option>
-        </select>
-      </label>
-      <label>Admin approval
-        <select onchange="updateCertificateSetting('adminApproved', this.value)">
-          <option value="false" ${!settings.adminApproved ? "selected" : ""}>Pending</option>
-          <option value="true" ${settings.adminApproved ? "selected" : ""}>Approved</option>
-        </select>
-      </label>
-      <label>Minimum pass mark
-        <input type="number" value="${settings.minimumPassMark}" onchange="updateCertificateSetting('minimumPassMark', this.value)" />
-      </label>
-      <label>Student final grade
-        <input type="number" value="${settings.finalGrade}" onchange="updateCertificateSetting('finalGrade', this.value)" />
-      </label>
-      <label>Primary color
-        <input type="color" value="${settings.primaryColor}" onchange="updateCertificateSetting('primaryColor', this.value)" />
-      </label>
-      <label>Accent color
-        <input type="color" value="${settings.accentColor}" onchange="updateCertificateSetting('accentColor', this.value)" />
-      </label>
-      <label>Design theme
-        <select onchange="updateCertificateSetting('designTheme', this.value)">
-          <option ${settings.designTheme === "Premium Blue and Gold" ? "selected" : ""}>Premium Blue and Gold</option>
-          <option ${settings.designTheme === "Formal Minimal" ? "selected" : ""}>Formal Minimal</option>
-        </select>
-      </label>
-      <div class="system-certificate-assets full-field">
-        <strong>Built-in demo certificate assets</strong>
-        <span>Lecturer: ${settings.lecturerName}</span>
-        <span>Director/admin: ${settings.directorName}</span>
-        <span>AQODH logo, lecturer signature, director signature, and official seal are generated automatically by the system.</span>
-      </div>
-    </div>
-    <div class="certificate-admin-actions">
-      <button class="ghost-button" onclick="revokeCertificate()">Revoke Certificate</button>
-      <button class="ghost-button" onclick="viewCertificate()">View Certificate</button>
-      <button class="primary-button" onclick="regenerateCertificate()">Regenerate Certificate</button>
-      <span class="pill ${record && !settings.certificateRevoked ? "success-pill" : "warning-pill"}">${record ? `Saved: ${record.certificateNumber}` : "No certificate generated"}</span>
-    </div>
-    ${verificationLogsTable()}
-  `;
+  return emptyBackendState("No backend certificate settings yet", "Certificate settings, certificate records, and verification logs need Prisma tables before this panel can manage real data.");
 }
 
 function verificationLogsTable() {
@@ -2899,12 +2873,11 @@ function enrollPage() {
         </form>
         <article class="card data-card half">
           <span class="label">Login</span>
-          <h2>Demo role access</h2>
-          <p class="muted">Switch roles to preview protected dashboard experiences for students, instructors, and admins.</p>
+          <h2>Existing AQODH account</h2>
+          <p class="muted">Sign in with your approved student, instructor, or admin account.</p>
           <div class="split-actions">
-            <button class="ghost-button" onclick="setRole('student')">Student login</button>
-            <button class="ghost-button" onclick="setRole('instructor')">Instructor login</button>
-            <button class="ghost-button" onclick="setRole('admin')">Admin login</button>
+            <button class="ghost-button" onclick="setView('login')">Login</button>
+            <button class="ghost-button" onclick="setView('register')">Register</button>
           </div>
         </article>
       </div>
@@ -2913,19 +2886,19 @@ function enrollPage() {
 }
 
 function studentTable() {
+  const rows = appState.instructorDashboardData?.students || appState.adminDashboardData?.users?.filter((user) => user.role === "student") || [];
   return `
     <div class="table-wrap"><table>
-      <thead><tr><th>Name</th><th>Progress</th><th>Quiz</th><th>Project</th><th>Risk</th></tr></thead>
+      <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Role</th></tr></thead>
       <tbody>
-        ${students.map((student) => `
+        ${rows.map((student) => `
           <tr>
-            <td><strong>${student.name}</strong></td>
-            <td>${student.progress}%</td>
-            <td>${student.quiz}%</td>
-            <td>${student.project}</td>
-            <td><span class="pill">${student.risk}</span></td>
+            <td><strong>${student.fullName}</strong></td>
+            <td>${student.email}</td>
+            <td><span class="pill">${student.status}</span></td>
+            <td>${student.role}</td>
           </tr>
-        `).join("")}
+        `).join("") || `<tr><td colspan="4">No backend students found.</td></tr>`}
       </tbody>
     </table></div>
   `;
@@ -2936,102 +2909,58 @@ function statCard(label, value) {
 }
 
 function studentProgressTable() {
+  const rows = appState.instructorDashboardData?.progressRecords || appState.adminDashboardData?.progressRecords || [];
   return `
     <div class="table-wrap"><table>
-      <thead><tr><th>Student Name</th><th>Email</th><th>Progress</th><th>Last Active</th><th>Quiz Average</th><th>Status</th><th>Action</th></tr></thead>
+      <thead><tr><th>Student Name</th><th>Email</th><th>Course</th><th>Current Module</th><th>Current Lesson</th><th>Progress</th><th>Final Grade</th><th>Updated</th></tr></thead>
       <tbody>
-        ${students.map((student) => `
+        ${rows.map((record) => `
           <tr>
-            <td><strong>${student.name}</strong></td>
-            <td>${student.email}</td>
-            <td>${student.progress}%</td>
-            <td>${student.lastActive}</td>
-            <td>${student.quiz}%</td>
-            <td><span class="pill">${student.status}</span></td>
-            <td><button class="ghost-button table-button">View Details</button></td>
+            <td><strong>${record.student?.fullName || "Unknown student"}</strong></td>
+            <td>${record.student?.email || "-"}</td>
+            <td>${record.course?.title || appState.adminDashboardData?.courses?.find((courseItem) => courseItem.id === record.courseId)?.title || "-"}</td>
+            <td>${record.currentModule?.title || "-"}</td>
+            <td>${record.currentLesson?.title || "-"}</td>
+            <td>${Math.round(Number(record.progressPercentage || 0))}%</td>
+            <td>${Math.round(Number(record.finalGrade || 0))}%</td>
+            <td>${record.updatedAt ? new Date(record.updatedAt).toLocaleDateString() : "-"}</td>
           </tr>
-        `).join("")}
+        `).join("") || `<tr><td colspan="8">No backend progress records found.</td></tr>`}
       </tbody>
     </table></div>
   `;
 }
 
 function submissionsTable() {
-  return `
-    <div class="table-wrap"><table>
-      <thead><tr><th>Student</th><th>Assignment</th><th>Submitted Date</th><th>Status</th><th>Grade</th><th>Action</th></tr></thead>
-      <tbody>
-        ${submissions.map((submission) => `
-          <tr>
-            <td><strong>${submission.student}</strong></td>
-            <td>${submission.assignment}</td>
-            <td>${submission.submitted}</td>
-            <td><span class="pill">${submission.status}</span></td>
-            <td>${submission.grade}</td>
-            <td><button class="ghost-button table-button">View Details</button></td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table></div>
-  `;
+  return emptyBackendState("No backend submissions yet", "Assignment submission tables are not part of the current Prisma foundation.");
 }
 
 function recentUsersTable() {
+  const rows = (appState.adminDashboardData?.users || appState.users).slice(0, 6);
   return `
     <div class="table-wrap"><table>
       <thead><tr><th>Name</th><th>Role</th><th>Email</th><th>Joined Date</th><th>Status</th></tr></thead>
       <tbody>
-        ${students.map((student) => `
+        ${rows.map((user) => `
           <tr>
-            <td><strong>${student.name}</strong></td>
-            <td>${student.role}</td>
-            <td>${student.email}</td>
-            <td>${student.joined}</td>
-            <td><span class="pill">${student.status}</span></td>
+            <td><strong>${user.fullName}</strong></td>
+            <td>${user.role}</td>
+            <td>${user.email}</td>
+            <td>${user.createdAt ? new Date(user.createdAt).toLocaleDateString() : "-"}</td>
+            <td><span class="pill">${user.status}</span></td>
           </tr>
-        `).join("")}
+        `).join("") || `<tr><td colspan="5">No backend users found.</td></tr>`}
       </tbody>
     </table></div>
   `;
 }
 
 function paymentsTable() {
-  return `
-    <div class="table-wrap"><table>
-      <thead><tr><th>Student</th><th>Course</th><th>Amount</th><th>Status</th><th>Date</th></tr></thead>
-      <tbody>
-        ${payments.map((payment) => `
-          <tr>
-            <td><strong>${payment.student}</strong></td>
-            <td>${payment.course}</td>
-            <td>${payment.amount}</td>
-            <td><span class="pill">${payment.status}</span></td>
-            <td>${payment.date}</td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table></div>
-  `;
+  return emptyBackendState("No backend payments yet", "Payment tables are planned, but are not part of the current Prisma foundation.");
 }
 
 function certificatesTable() {
-  return `
-    <div class="table-wrap"><table>
-      <thead><tr><th>Student</th><th>Course</th><th>Completion %</th><th>Final Grade</th><th>Certificate Status</th><th>Action</th></tr></thead>
-      <tbody>
-        ${certificates.map((certificate) => `
-          <tr>
-            <td><strong>${certificate.student}</strong></td>
-            <td>${certificate.course}</td>
-            <td>${certificate.completion}</td>
-            <td>${certificate.grade}</td>
-            <td><span class="pill">${certificate.status}</span></td>
-            <td class="action-set"><button class="ghost-button table-button">Approve</button><button class="ghost-button table-button">Reject</button><button class="ghost-button table-button" onclick="viewCertificate()">View</button></td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table></div>
-  `;
+  return emptyBackendState("No backend certificates yet", "Certificate tables are planned, but are not part of the current Prisma foundation.");
 }
 
 function simpleRows(rows) {
@@ -3070,4 +2999,28 @@ function render() {
   shell((views[appState.view] || home)());
 }
 
-render();
+async function initializeApp() {
+  const requestedView = viewForPath(window.location.pathname);
+  appState.view = requestedView;
+  const requestedRole = protectedRouteRole(requestedView);
+  const user = await restoreCurrentUser();
+
+  if (requestedRole && (!user || user.role !== requestedRole || user.status !== "ACTIVE")) {
+    appState.authMessage = `Please log in as ${requestedRole} to access this dashboard.`;
+    setView("login");
+    return;
+  }
+
+  if (user && appState.view === "login") {
+    redirectByRole(user.role);
+    return;
+  }
+
+  render();
+}
+
+window.addEventListener("popstate", () => {
+  setView(viewForPath(window.location.pathname), { skipHistory: true });
+});
+
+initializeApp();

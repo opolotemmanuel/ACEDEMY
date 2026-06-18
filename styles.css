@@ -111,9 +111,10 @@ a {
 }
 
 .brand-mark img {
-  width: 100%;
-  height: 100%;
+  width: 34px;
+  height: 34px;
   display: block;
+  object-fit: contain;
 }
 
 .nav {
