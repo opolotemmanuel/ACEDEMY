@@ -281,6 +281,8 @@ const appState = {
     admin: "Dashboard",
   },
   backendCourse: null,
+  publicCourse: null,
+  publicCourseLoading: false,
   backendProgress: null,
   backendLearningLoading: false,
   adminDashboardData: null,
@@ -301,6 +303,8 @@ function viewForPath(pathname) {
   if (pathname === "/login") return "login";
   if (pathname === "/register") return "register";
   if (pathname === "/profile") return "profile";
+  if (pathname === "/privacy-policy") return "privacy-policy";
+  if (pathname === "/terms-of-service") return "terms-of-service";
   if (pathname.startsWith("/certificates/verify/")) return "certificate-verify";
   return "home";
 }
@@ -311,6 +315,8 @@ function pathForView(view) {
     login: "/login",
     register: "/register",
     profile: "/profile",
+    "privacy-policy": "/privacy-policy",
+    "terms-of-service": "/terms-of-service",
     "student-dashboard": "/student/dashboard",
     "instructor-dashboard": "/instructor/dashboard",
     "admin-dashboard": "/admin/dashboard",
@@ -384,6 +390,24 @@ function normalizeBackendCourse(courseData) {
       })),
     })),
   };
+}
+
+function landingCourse() {
+  return appState.publicCourse || course;
+}
+
+function ensurePublicCourseLoaded() {
+  if (appState.publicCourse || appState.publicCourseLoading) return;
+  appState.publicCourseLoading = true;
+  apiRequest("/api/courses/current")
+    .then(({ course: courseData }) => {
+      appState.publicCourse = normalizeBackendCourse(courseData);
+      appState.publicCourseLoading = false;
+      if (appState.view === "home") render();
+    })
+    .catch(() => {
+      appState.publicCourseLoading = false;
+    });
 }
 
 function backendCourseList(role = "admin") {
@@ -705,7 +729,8 @@ async function enroll() {
       const selectedCourse = catalog.courses?.[0];
       if (selectedCourse) {
         const enrollment = await apiRequest("/api/enrollments", { method: "POST", body: JSON.stringify({ courseId: selectedCourse.id }) });
-        applyBackendLearningState(enrollment);
+        const courseFoundation = await fetchStudentCourseFoundation(enrollment);
+        applyBackendLearningState(courseFoundation);
         appState.enrolled = true;
         setView("student-dashboard");
         return;
@@ -731,7 +756,8 @@ async function continueLearning() {
   if (appState.session) {
     try {
       const contentData = await apiRequest("/api/student/learning-state");
-      applyBackendLearningState(contentData);
+      const courseFoundation = await fetchStudentCourseFoundation(contentData);
+      applyBackendLearningState(courseFoundation);
       render();
       return;
     } catch (error) {
@@ -747,6 +773,7 @@ function ensureBackendLearningLoaded() {
   if (!appState.session || currentUser()?.role !== "student" || appState.backendCourse || appState.backendLearningLoading) return;
   appState.backendLearningLoading = true;
   apiRequest("/api/student/learning-state")
+    .then(fetchStudentCourseFoundation)
     .then((data) => {
       applyBackendLearningState(data);
       appState.backendLearningLoading = false;
@@ -755,6 +782,25 @@ function ensureBackendLearningLoaded() {
     .catch(() => {
       appState.backendLearningLoading = false;
     });
+}
+
+async function fetchStudentCourseFoundation(state) {
+  if (!state?.course?.id) return state;
+  const [{ course: courseData }, { modules }] = await Promise.all([
+    apiRequest(`/api/courses/${state.course.id}`),
+    apiRequest(`/api/courses/${state.course.id}/modules`),
+  ]);
+  const modulesWithLessons = await Promise.all((modules || []).map(async (module) => {
+    const { lessons } = await apiRequest(`/api/modules/${module.id}/lessons`);
+    return { ...module, lessons: lessons || [] };
+  }));
+  return {
+    ...state,
+    course: {
+      ...courseData,
+      modules: modulesWithLessons,
+    },
+  };
 }
 
 function ensureDashboardDataLoaded(role) {
@@ -1103,19 +1149,20 @@ function shell(content) {
         <button class="hamburger" onclick="toggleSidebar()" aria-label="Open sidebar">☰</button>
         <a class="brand" href="#" onclick="setView('home')">
           <span class="brand-mark"><img src="/assets/aqodh-logo.svg" alt="AQODH Academy logo" /></span>
-          <span>AQODH Academy</span>
+          <span class="brand-text"><strong>AQODH Academy</strong><small>Ethical Computing</small></span>
         </a>
         <label class="header-search" aria-label="Search">
           <input placeholder="Search courses, lessons, learners" />
         </label>
         <nav class="nav" aria-label="Main navigation">
           ${navButton("Home", "home")}
-          ${navButton("Course", "course")}
+          ${navButton("Curriculum", "course")}
           ${navButton("Register", "register")}
           ${user?.role === "admin" ? navButton("Verify", "certificate-verify") : ""}
         </nav>
-        <div class="user-menu">
-          <span class="notify-dot"></span>
+        <div class="user-menu header-actions">
+          ${user ? `<button class="ghost-button signin-button" onclick="setView('profile')">Profile</button>` : `<button class="ghost-button signin-button" onclick="setView('login')">Sign In</button>`}
+          <button class="primary-button enroll-button" onclick="enroll()">Enroll</button>
         </div>
       </header>
       ${content}
@@ -1129,23 +1176,365 @@ function initials(name) {
 }
 
 function home() {
+  ensurePublicCourseLoaded();
+  const featuredCourse = landingCourse();
+  const moduleCount = featuredCourse.modules?.length || course.modules.length;
+  const lessonCount = (featuredCourse.modules || course.modules).reduce((sum, module) => sum + (module.lessons?.length || 0), 0);
   return `
     <main class="public-main">
       <section class="hero">
+        <div class="hero-ambient" aria-hidden="true"></div>
         <div class="hero-content">
-          <p class="eyebrow">AQODH Academy online course</p>
-          <h1>${course.title}</h1>
-          <p>Learn how to make responsible technology decisions across privacy, AI, cybersecurity, social media, and ethical product design.</p>
-          <div class="hero-actions">
-            <button class="primary-button" onclick="enroll()">Enroll now</button>
-            <button class="ghost-button" onclick="setView('course')">View modules</button>
+          <div class="hero-copy">
+            <p class="eyebrow">Building Technology That Protects Humanity</p>
+            <h1>Building Technology That Protects Humanity</h1>
+            <p>Learn Ethical Computing, Responsible AI, Digital Rights, Privacy, and Technology Governance through a serious academy platform built for trust.</p>
+            <div class="hero-actions">
+              <button class="primary-button hero-primary" onclick="enroll()">Start learning</button>
+              <button class="ghost-button" onclick="setView('course')">Explore Curriculum</button>
+              <button class="ghost-button" onclick="setView('login')">Login</button>
+            </div>
+          </div>
+          <div class="hero-panel institutional-illustration" aria-label="AQODH Academy ethical computing focus areas">
+            <div class="hero-panel-top">
+              <span class="pill">AQODH Academy</span>
+              <span class="hero-logo-mini"><img src="/assets/aqodh-logo.svg" alt="" /></span>
+            </div>
+            <h2>Ethical Computing Institution</h2>
+            <div class="network-map" aria-hidden="true">
+              <span class="network-node center">ETHICS</span>
+              <span class="network-node ai">AI</span>
+              <span class="network-node privacy">Privacy</span>
+              <span class="network-node security">Security</span>
+              <span class="network-node rights">Rights</span>
+              <span class="network-node gov">Governance</span>
+            </div>
+            <div class="hero-signal-grid">
+              <span><strong>${moduleCount}</strong> Modules</span>
+              <span><strong>${lessonCount || "24+"}</strong> Lessons</span>
+              <span><strong>QR</strong> Certificate</span>
+            </div>
           </div>
         </div>
+        <div class="hero-bottom-strip">
+          <span>Students</span>
+          <span>Instructors</span>
+          <span>Administrators</span>
+          <span>Certificates</span>
+          <span>Progress Tracking</span>
+        </div>
       </section>
-      ${overview()}
-      ${modulePreview()}
-      ${pricing()}
+      ${whyAqodhSection()}
+      ${problemSection()}
+      ${frameworkSection()}
+      ${featuredCourseSection(featuredCourse)}
+      ${learningExperienceSection()}
+      ${certificateTrustSection()}
+      ${futureVisionSection()}
+      ${finalCallout()}
     </main>
+  `;
+}
+
+function whyAqodhSection() {
+  const items = [
+    ["EA", "Ethical AI", "Understand fairness, accountability, transparency, and human oversight in AI systems."],
+    ["DR", "Digital Rights", "Study privacy, consent, dignity, access, and the responsibilities of digital institutions."],
+    ["RI", "Responsible Innovation", "Move from ideas to products using ethical review, governance, and impact thinking."],
+  ];
+
+  return `
+    <section class="section why-section">
+      <div class="section-inner">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">Why AQODH</p>
+            <h2>A serious home for ethical technology education.</h2>
+            <p>AQODH Academy connects academic discipline with practical technology governance, helping learners build systems people can trust.</p>
+          </div>
+        </div>
+        <div class="premium-card-grid">
+          ${items.map(([icon, title, body]) => `
+            <article class="premium-card why-card">
+              <span class="premium-icon">${icon}</span>
+              <h3>${title}</h3>
+              <p>${body}</p>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function problemSection() {
+  const items = [
+    ["AI Bias", "Growing concern", "Automated systems can reproduce unfair outcomes when data, design, and oversight are weak."],
+    ["Privacy Breaches", "Critical challenge", "Digital services collect sensitive information faster than many users can understand or control."],
+    ["Cybercrime", "Critical challenge", "Security decisions increasingly shape safety, trust, and access to essential digital services."],
+    ["Digital Exclusion", "Growing concern", "Technology can leave communities behind when equity and accessibility are treated as afterthoughts."],
+  ];
+
+  return `
+    <section class="section problem-section">
+      <div class="section-inner">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">The Problem</p>
+            <h2>Technology is advancing faster than ethics.</h2>
+            <p>The academy prepares learners to recognize serious digital risks and respond with practical, accountable methods.</p>
+          </div>
+        </div>
+        <div class="insight-grid">
+          ${items.map(([title, status, body]) => `
+            <article class="insight-card">
+              <span class="pill">${status}</span>
+              <h3>${title}</h3>
+              <p>${body}</p>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function frameworkSection() {
+  const steps = ["Awareness", "Knowledge", "Application", "Certification", "Leadership"];
+  return `
+    <section class="section framework-section">
+      <div class="section-inner">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">AQODH Framework</p>
+            <h2>A clear journey from awareness to leadership.</h2>
+            <p>Each learner moves through a structured path that turns ethical concern into professional competence.</p>
+          </div>
+        </div>
+        <div class="framework-timeline">
+          ${steps.map((step, index) => `
+            <article class="framework-step">
+              <span>${index + 1}</span>
+              <strong>${step}</strong>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function featuredCourseSection(featuredCourse) {
+  const modules = featuredCourse.modules || course.modules;
+  const details = [
+    [`${featuredCourse.duration || course.duration}`, "Duration"],
+    [featuredCourse.level || course.level, "Level"],
+    ["Certificate included", "Credential"],
+    [`${modules.length} modules`, "Structure"],
+    ["Quizzes and assignments", "Assessment"],
+    ["Progress tracking", "Dashboard"],
+  ];
+
+  return `
+    <section class="section featured-course-section">
+      <div class="section-inner featured-course-layout">
+        <div class="featured-course-copy">
+          <p class="eyebrow">Featured Course</p>
+          <h2>${featuredCourse.title || course.title}</h2>
+          <p>${featuredCourse.description || "A foundational course for students, professionals, instructors, and organizations seeking practical ethical computing capability."}</p>
+          <div class="featured-detail-grid">
+            ${details.map(([value, label]) => `
+              <article>
+                <strong>${value}</strong>
+                <span>${label}</span>
+              </article>
+            `).join("")}
+          </div>
+          <button class="primary-button" onclick="enroll()">Enroll Now</button>
+        </div>
+        <div class="curriculum-preview">
+          ${modules.slice(0, 6).map((module, index) => `
+            <article>
+              <span>Module ${index + 1}</span>
+              <strong>${module.title}</strong>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function learningExperienceSection() {
+  const features = [
+    ["Student dashboard", "Focused learning space for modules, lessons, progress, and certificates."],
+    ["Continue Learning", "Return to the current module, lesson, and unfinished activity."],
+    ["Module tabs", "Move through course sections without leaving the dashboard."],
+    ["Quizzes", "Objective checks support auto-marking and feedback."],
+    ["Assignments", "Long-answer work supports review and instructor override."],
+    ["Certificate engine", "Eligibility, QR verification, and certificate status stay controlled."],
+    ["AI insights for admin", "Operational signals help administrators review progress and risk."],
+  ];
+
+  return `
+    <section class="section learning-section">
+      <div class="section-inner learning-layout">
+        <div class="dashboard-preview" aria-label="AQODH dashboard preview">
+          <div class="preview-sidebar"></div>
+          <div class="preview-main">
+            <div class="preview-bar"></div>
+            <div class="preview-cards">
+              <span></span><span></span><span></span>
+            </div>
+            <div class="preview-workspace"></div>
+          </div>
+        </div>
+        <div>
+          <p class="eyebrow">Learning Experience</p>
+          <h2>Everything important happens inside the platform.</h2>
+          <div class="feature-list">
+            ${features.map(([title, body]) => `
+              <article>
+                <span class="status-dot done"></span>
+                <div>
+                  <strong>${title}</strong>
+                  <p>${body}</p>
+                </div>
+              </article>
+            `).join("")}
+          </div>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function certificateTrustSection() {
+  return `
+    <section class="section certificate-trust-section">
+      <div class="section-inner certificate-trust-layout">
+        <div>
+          <p class="eyebrow">Certificate Trust</p>
+          <h2>Credentials should be verifiable, controlled, and professional.</h2>
+          <p>AQODH certificate records are designed around eligibility checks, certificate numbers, QR verification, and status control.</p>
+          <button class="ghost-button" onclick="openVerification()">View verification</button>
+        </div>
+        <article class="certificate-preview-card">
+          <span class="certificate-seal">AQODH</span>
+          <p class="label">Certificate Preview</p>
+          <h3>Student Name</h3>
+          <p>has completed</p>
+          <strong>Ethical Computing Fundamentals</strong>
+          <div class="certificate-meta">
+            <span>No. AQODH-ECF-0001</span>
+            <span>QR verification</span>
+          </div>
+          <div class="qr-preview" aria-hidden="true"></div>
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function futureVisionSection() {
+  const roadmap = ["Academy", "Certification Authority", "AI Auditing", "Digital Rights Center", "Research Institute"];
+  return `
+    <section class="section future-section">
+      <div class="section-inner">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">Future Vision</p>
+            <h2>From learning platform to ethical technology institution.</h2>
+            <p>AQODH Academy is the foundation for a broader mission in certification, auditing, rights protection, and research.</p>
+          </div>
+        </div>
+        <div class="future-roadmap">
+          ${roadmap.map((item, index) => `
+            <article>
+              <span>${index + 1}</span>
+              <strong>${item}</strong>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function impactStrip() {
+  const items = [
+    ["Role-secure", "Dashboards protect student, instructor, and admin workflows."],
+    ["Practice-led", "Quizzes, assignments, and case reviews turn ethics into action."],
+    ["Verifiable", "Completion can lead to QR-backed certificate verification."],
+  ];
+
+  return `
+    <section class="impact-strip">
+      <div class="section-inner impact-grid">
+        ${items.map(([title, body]) => `
+          <article class="impact-item">
+            <span class="impact-icon">${title.slice(0, 2)}</span>
+            <div>
+              <strong>${title}</strong>
+              <p>${body}</p>
+            </div>
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function experienceSection() {
+  const lanes = [
+    ["Student", "Learn inside one dashboard, continue from the last unfinished activity, and watch your progress move."],
+    ["Instructor", "Build modules, upload documents, manage quizzes, review submissions, and override grades when judgment matters."],
+    ["Admin", "Approve users, manage payments, configure certificate rules, and keep records accountable."],
+  ];
+
+  return `
+    <section class="section experience-section">
+      <div class="section-inner experience-layout">
+        <div class="experience-copy">
+          <p class="eyebrow">One platform, clear responsibility</p>
+          <h2>A learning experience designed for trust from the first click.</h2>
+          <p>Every part of AQODH Academy points learners toward responsible decisions: secure access, structured modules, meaningful assessments, and certificate checks that preserve credibility.</p>
+          <div class="hero-actions">
+            <button class="primary-button" onclick="setView('register')">Create account</button>
+            <button class="ghost-button" onclick="setView('student-dashboard')">Preview dashboard</button>
+          </div>
+        </div>
+        <div class="experience-board" aria-label="Role pathways">
+          ${lanes.map(([role, body], index) => `
+            <article class="experience-lane">
+              <span class="lane-number">0${index + 1}</span>
+              <div>
+                <h3>${role}</h3>
+                <p>${body}</p>
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function finalCallout() {
+  return `
+    <section class="final-callout">
+      <div class="section-inner final-callout-inner">
+        <div>
+          <p class="eyebrow">Join the movement</p>
+          <h2>Join the Movement for Ethical Technology</h2>
+          <p>Learn, teach, partner, and help build digital systems worthy of public trust.</p>
+        </div>
+        <div class="hero-actions">
+          <button class="primary-button" onclick="enroll()">Enroll Today</button>
+          <button class="ghost-button" onclick="setView('register')">Partner With AQODH</button>
+        </div>
+      </div>
+    </section>
   `;
 }
 
@@ -2447,6 +2836,71 @@ function coursePage() {
   `;
 }
 
+function legalPage(title, intro, sections) {
+  return `
+    <main class="public-main legal-main">
+      <section class="legal-hero">
+        <div class="legal-container">
+          <p class="eyebrow">AQODH Academy Policy</p>
+          <h1>${title}</h1>
+          <p>${intro}</p>
+          <span class="legal-updated">Last updated: June 24, 2026</span>
+        </div>
+      </section>
+      <section class="legal-body">
+        <div class="legal-container">
+          <aside class="legal-note">
+            This document is provided for platform transparency and should be reviewed by a qualified legal professional before production launch.
+          </aside>
+          ${sections.map(([heading, body]) => `
+            <article class="legal-section">
+              <h2>${heading}</h2>
+              <p>${body}</p>
+            </article>
+          `).join("")}
+        </div>
+      </section>
+    </main>
+  `;
+}
+
+function privacyPolicyPage() {
+  return legalPage("Privacy Policy", "This Privacy Policy explains how AQODH Academy handles information for learners, instructors, administrators, certificate verification, and platform operations.", [
+    ["Introduction", "AQODH Academy is an Ethical Computing learning platform. We collect and use information to provide secure accounts, course access, learning dashboards, assessments, payment status checks, progress tracking, and certificate verification."],
+    ["Information we collect", "We may collect information you provide directly, information generated by your learning activity, technical information from your device or browser, and administrative records needed to operate the academy."],
+    ["Account information", "Account records may include your name, email address, role, login status, password security metadata, contact details, and account status. Passwords must be stored securely and are not displayed in platform responses."],
+    ["Course and learning data", "The platform may process enrollments, current course, current module, lesson activity, quiz attempts, assignment submissions, grades, completion records, and progress percentages."],
+    ["Payment-related data", "AQODH Academy may store payment status information such as pending payment, fully paid, manual approval, free course access, and related administrative approval records. Full payment processing details should be handled by secure payment providers when integrated."],
+    ["Certificate and verification data", "Certificate records may include student name, course name, grade, issue date, certificate number, QR verification link, certificate status, revocation status, and verification logs."],
+    ["How we use information", "We use information to authenticate users, enforce role-based access, deliver course content, track progress, evaluate assessments, manage payments, issue certificates, verify credentials, improve platform reliability, and support administrative oversight."],
+    ["How we protect information", "The platform should use secure authentication, password hashing, authorization middleware, input validation, controlled file uploads, environment-based secrets, and reasonable operational safeguards."],
+    ["Data sharing and third parties", "We do not sell learner data. Information may be shared with service providers needed for hosting, email, payments, analytics, file storage, or certificate verification, subject to appropriate controls."],
+    ["Student rights and choices", "Students may request access to account information, correction of inaccurate details, support with account status, or information about certificate records where applicable."],
+    ["Cookies/local storage", "The platform may use cookies, secure sessions, or browser local storage to maintain login state, remember learning progress in demo mode, support certificate settings, and improve user experience."],
+    ["Data retention", "Records are retained as long as needed for learning access, legal, security, accounting, certificate verification, and institutional reporting purposes. Retention rules should be finalized before production launch."],
+    ["Children/minors note", "AQODH Academy is intended for responsible educational use. If minors use the platform, appropriate guardian, school, or institutional consent requirements should be reviewed before production launch."],
+    ["Contact information", "For privacy questions or account support, contact AQODH Academy at hello@aqodh.academy."],
+  ]);
+}
+
+function termsOfServicePage() {
+  return legalPage("Terms of Service", "These Terms of Service describe the basic expectations for using AQODH Academy as a student, instructor, administrator, or certificate verifier.", [
+    ["Introduction", "By using AQODH Academy, users agree to use the platform responsibly and in support of ethical learning, privacy, security, accountability, and professional digital education."],
+    ["User accounts", "Users are responsible for providing accurate account information, protecting login credentials, and using only the role and permissions assigned to them by the platform."],
+    ["Acceptable use", "Users must not attempt unauthorized access, disrupt platform services, upload unsafe files, misuse learning materials, impersonate others, or bypass payment, progress, certificate, or role-based access rules."],
+    ["Course access", "Course access may depend on registration, enrollment, payment status, manual approval, instructor assignment, or administrative settings. Students should complete learning activities inside the student dashboard where required."],
+    ["Payments and refunds placeholder", "Payment terms, refund rules, taxes, manual approval procedures, and third-party payment provider terms should be finalized before production launch."],
+    ["Assignments, quizzes, and academic integrity", "Students must submit their own work, follow assessment instructions, and avoid cheating, plagiarism, or manipulation of auto-marking and grading workflows."],
+    ["Certificates and verification", "Certificates may be issued only when eligibility rules are met. AQODH Academy may revoke, regenerate, or verify certificates according to platform records and administrative controls."],
+    ["Intellectual property", "Course content, platform design, certificate assets, AQODH branding, lecturer signatures, official seals, and learning materials are protected by their respective owners and may not be misused."],
+    ["Platform availability", "AQODH Academy aims to provide reliable access, but availability may be affected by maintenance, hosting, network issues, upgrades, security events, or third-party service interruptions."],
+    ["Limitation of liability placeholder", "Liability limitations, warranties, disclaimers, and jurisdiction-specific terms should be reviewed and finalized by a qualified legal professional before production launch."],
+    ["Account suspension", "AQODH Academy may suspend or restrict accounts that violate these terms, threaten platform security, misuse course access, or interfere with certificate integrity."],
+    ["Changes to terms", "These terms may be updated as the platform evolves. Material changes should be communicated through reasonable platform or email notices where appropriate."],
+    ["Contact information", "For terms, account, or platform support questions, contact AQODH Academy at hello@aqodh.academy."],
+  ]);
+}
+
 function instructorDashboard() {
   ensureDashboardDataLoaded("instructor");
   const sidebar = dashboardSidebarItems("instructor");
@@ -2971,9 +3425,52 @@ function footer() {
   return `
     <footer class="footer">
       <div class="footer-inner">
-        <strong>AQODH Academy</strong>
-        <span>Contact: hello@aqodh.academy</span>
-        <span>LinkedIn · X · YouTube</span>
+        <section class="footer-brand-column">
+          <a class="footer-brand" href="#" onclick="setView('home')">
+            <span class="brand-mark"><img src="/assets/aqodh-logo.svg" alt="AQODH Academy logo" /></span>
+            <span>AQODH Academy</span>
+          </a>
+          <p>Building Technology That Protects Humanity through ethical computing education, responsible AI, privacy, digital rights, and technology governance.</p>
+          <form class="newsletter-form" onsubmit="event.preventDefault()">
+            <label for="newsletter-email">Newsletter</label>
+            <div>
+              <input id="newsletter-email" type="email" placeholder="Email address" aria-label="Email address" />
+              <button class="primary-button" type="submit">Subscribe</button>
+            </div>
+          </form>
+        </section>
+        <section>
+          <h3>Learning</h3>
+          <button onclick="setView('course')">Curriculum</button>
+          <button onclick="enroll()">Enroll Today</button>
+          <button onclick="setView('student-dashboard')">Student Dashboard</button>
+          <button onclick="setView('certificate-verify')">Certificate Verification</button>
+        </section>
+        <section>
+          <h3>Research</h3>
+          <button onclick="setView('home')">Ethical AI</button>
+          <button onclick="setView('home')">Digital Rights</button>
+          <button onclick="setView('home')">Technology Governance</button>
+          <button onclick="setView('home')">Responsible Innovation</button>
+        </section>
+        <section>
+          <h3>Contact</h3>
+          <p>hello@aqodh.academy</p>
+          <p>AQODH Academy</p>
+          <div class="social-links" aria-label="Social links">
+            <span>in</span>
+            <span>X</span>
+            <span>YT</span>
+          </div>
+        </section>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 AQODH Academy. All rights reserved.</span>
+        <div>
+          <button onclick="setView('privacy-policy')">Privacy Policy</button>
+          <button onclick="setView('terms-of-service')">Terms of Service</button>
+          <button onclick="setView('login')">Sign In</button>
+        </div>
       </div>
     </footer>
   `;
@@ -2990,6 +3487,8 @@ function render() {
     "reset-password": resetPasswordPage,
     "verify-email": verifyEmailPage,
     profile: profilePage,
+    "privacy-policy": privacyPolicyPage,
+    "terms-of-service": termsOfServicePage,
     "student-dashboard": studentDashboard,
     "instructor-dashboard": instructorDashboard,
     "admin-dashboard": adminDashboard,
